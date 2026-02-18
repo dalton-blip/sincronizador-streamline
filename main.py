@@ -2,6 +2,7 @@ import requests
 import json
 import os
 import time
+import calendar
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -22,7 +23,7 @@ HEADERS_NOTION = {
     "Notion-Version": "2022-06-28"
 }
 
-# --- FUNÇÕES AUXILIARES ---
+# --- FUNÇÕES ---
 
 def parse_dt_robusto(data_str):
     if not data_str: return None
@@ -101,6 +102,7 @@ def upsert_reserva(reserva):
     page_id = buscar_pagina_notion(res_id)
     payload = {"properties": props}
     
+    # Tentativa com retry
     for _ in range(3):
         try:
             if page_id:
@@ -116,89 +118,79 @@ def upsert_reserva(reserva):
         except:
             time.sleep(1)
 
-def baixar_reserva_individual(res_id):
-    """Baixa UMA única reserva pelo ID usando a data RECENTE para não travar"""
-    payload = {
-        "methodName": "GetReservationsFiltered",
-        "params": {
-            "token_key": STREAMLINE_KEY,
-            "token_secret": STREAMLINE_SECRET,
-            "confirmation_id": res_id, 
-            # AQUI ESTAVA O ERRO: Mudei de 2010 para 2024
-            "modified_since": "2024-01-01 00:00:00", 
-            "return_full": True
-        }
-    }
-    try:
-        r = requests.post(URL_STREAMLINE, json=payload, timeout=30)
-        dados = r.json()
-        
-        # Se der erro, vamos imprimir o motivo real
-        if isinstance(dados, dict) and 'status' in dados and dados['status'].get('code') != '0':
-             print(f" (Erro API: {dados['status'].get('description')})", end="")
-             return []
-
-        if 'data' in dados and 'reservations' in dados['data']:
-            return dados['data']['reservations']
-        elif 'Response' in dados:
-            return dados['Response'].get('data', [])
-        return []
-    except Exception as e:
-        print(f" (Erro Conexão: {e})", end="")
-        return []
-
 def executar_sincronizacao():
-    print("🚀 Sincronização Final (Filtro 2024 Ajustado)...")
+    print("🚀 Sincronização MÊS A MÊS (2024-2026)...")
     
-    # Busca IDs recentes
-    payload_ids = {
-        "methodName": "GetReservationsFiltered",
-        "params": {
-            "token_key": STREAMLINE_KEY,
-            "token_secret": STREAMLINE_SECRET,
-            "modified_since": "2024-01-01 00:00:00",
-            "return_full": False
-        }
-    }
-    
-    todos_ids = []
-    try:
-        r = requests.post(URL_STREAMLINE, json=payload_ids, timeout=60)
-        dados = r.json()
-        if 'data' in dados and 'confirmation_id' in dados['data']:
-            todos_ids = dados['data']['confirmation_id']
-        elif 'Response' in dados:
-             todos_ids = dados['Response'].get('data', {}).get('confirmation_id', [])
-    except Exception as e:
-        print(f"❌ Erro fatal: {e}")
-        return
-
-    total = len(todos_ids)
-    print(f"✅ Encontrados {total} IDs.")
-    
-    if total == 0: return
-
-    sucesso = 0
-    vazios = 0
-    
-    # Processa um por um
-    for i, res_id in enumerate(todos_ids):
-        # Feedback a cada 1
-        print(f"[{i+1}/{total}] ID {res_id}: ", end="")
+    # Loop de Anos
+    for ano in range(2024, 2027):
+        print(f"\n📂 Processando ANO {ano} ------------------")
         
-        detalhes = baixar_reserva_individual(res_id)
-        
-        if detalhes:
-            upsert_reserva(detalhes[0])
-            print("✅ Salvo!")
-            sucesso += 1
-        else:
-            print("⚠️ Falha.")
-            vazios += 1
+        # Loop de Meses
+        for mes in range(1, 13):
+            # Define o último dia do mês
+            ultimo_dia = calendar.monthrange(ano, mes)[1]
             
-        time.sleep(0.1)
+            # Formato ISO: YYYY-MM-DD (Confirmado pelo Debug que funciona)
+            dt_inicio = f"{ano}-{mes:02d}-01"
+            dt_fim = f"{ano}-{mes:02d}-{ultimo_dia}"
+            
+            print(f"   📅 Mês {mes:02d} ({dt_inicio} a {dt_fim}): ", end="")
 
-    print(f"\n🏁 FIM! Sucesso: {sucesso} | Falhas: {vazios}")
+            payload = {
+                "methodName": "GetReservationsFiltered",
+                "params": {
+                    "token_key": STREAMLINE_KEY,
+                    "token_secret": STREAMLINE_SECRET,
+                    "start_date": dt_inicio,
+                    "end_date": dt_fim,
+                    "date_type": "arrival", # Filtra pela chegada (Check-in)
+                    "return_full": True     # Traz detalhes completos
+                }
+            }
+
+            try:
+                # Timeout aumentado para 90s
+                response = requests.post(URL_STREAMLINE, json=payload, timeout=90)
+                
+                try:
+                    dados = response.json()
+                except:
+                    print("❌ Erro JSON/Timeout API.")
+                    continue
+
+                # Checa erro de limite (10k)
+                if isinstance(dados, dict) and 'status' in dados and dados['status'].get('code') == 'E0105':
+                    print("⚠️ Limite 10k atingido (Mês muito cheio).")
+                    # Aqui poderíamos quebrar em quinzenas, mas vamos torcer para passar
+                    continue
+
+                lista_reservas = []
+                if 'data' in dados and 'reservations' in dados['data']:
+                    lista_reservas = dados['data']['reservations']
+                elif 'Response' in dados:
+                    lista_reservas = dados['Response'].get('data', [])
+                
+                qtd = len(lista_reservas)
+                print(f"📦 {qtd} reservas encontradas.")
+
+                if qtd > 0:
+                    count_salvo = 0
+                    for r in lista_reservas:
+                        upsert_reserva(r)
+                        count_salvo += 1
+                        # Feedback visual simples (.)
+                        if count_salvo % 5 == 0:
+                            print(".", end="", flush=True)
+                    print(f" ✅ Concluído.")
+                
+                # Pausa para respirar entre meses
+                time.sleep(1)
+
+            except Exception as e:
+                print(f"❌ Erro Conexão: {e}")
+                time.sleep(2)
+
+    print("\n🏁 FIM! Execução completa.")
 
 if __name__ == "__main__":
     executar_sincronizacao()
