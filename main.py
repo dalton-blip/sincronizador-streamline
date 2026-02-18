@@ -22,7 +22,7 @@ HEADERS_NOTION = {
     "Notion-Version": "2022-06-28"
 }
 
-# --- FUNÇÕES DE DATA E NOTION ---
+# --- FUNÇÕES ---
 
 def parse_dt_robusto(data_str):
     if not data_str: return None
@@ -101,62 +101,49 @@ def upsert_reserva(reserva):
     page_id = buscar_pagina_notion(res_id)
     payload = {"properties": props}
     
-    # Tentativa de salvamento com Retry
-    for tentativa in range(3):
+    # Retry simples para o Notion
+    for _ in range(3):
         try:
             if page_id:
                 res = requests.patch(f"{URL_NOTION}/pages/{page_id}", json=payload, headers=HEADERS_NOTION)
-                print(f"   🔄 Atualizada: {res_id}")
             else:
                 payload["parent"] = {"database_id": NOTION_DATABASE_ID}
                 res = requests.post(f"{URL_NOTION}/pages", json=payload, headers=HEADERS_NOTION)
-                print(f"   ✨ Criada: {res_id}")
             
-            if res.status_code == 429: # Rate limit
+            if res.status_code == 429:
                 time.sleep(2)
                 continue
-            break
+            return # Sucesso
         except:
             time.sleep(1)
 
-# --- FUNÇÕES CORE DO STREAMLINE ---
-
-def baixar_detalhes_em_lote(lista_ids):
-    """Pega uma lista de IDs e baixa os detalhes usando GetReservationsFiltered filtrando por ID"""
-    
-    # Transforma a lista [123, 124] em string "123,124" (se API pedir string)
-    # Mas o Streamline geralmente aceita array no JSON. Vamos tentar array.
-    
+def baixar_reserva_individual(res_id):
+    """Baixa UMA única reserva pelo ID"""
     payload = {
         "methodName": "GetReservationsFiltered",
         "params": {
             "token_key": STREAMLINE_KEY,
             "token_secret": STREAMLINE_SECRET,
-            "confirmation_id": lista_ids, # O TRUQUE: Filtrar por estes IDs específicos
+            "confirmation_id": res_id, # Singular!
             "return_full": True
         }
     }
-    
     try:
-        r = requests.post(URL_STREAMLINE, json=payload, timeout=60)
+        r = requests.post(URL_STREAMLINE, json=payload, timeout=30)
         dados = r.json()
-        
-        reservas = []
         if 'data' in dados and 'reservations' in dados['data']:
-            reservas = dados['data']['reservations']
+            return dados['data']['reservations']
         elif 'Response' in dados:
-            reservas = dados['Response'].get('data', [])
-            
-        return reservas
-    except Exception as e:
-        print(f"❌ Erro ao baixar lote: {e}")
+            return dados['Response'].get('data', [])
+        return []
+    except:
         return []
 
 def executar_sincronizacao():
-    print("🚀 Sincronização HÍBRIDA (IDs -> Detalhes)...")
+    print("🚀 Sincronização Final (Modo Um-por-Um)...")
     
-    # 1. PEGAR A LISTA DE IDS (Isso é rápido e leve)
-    print("📋 Baixando lista de IDs recentes (Desde 2024)...")
+    # 1. PEGAR A LISTA DE IDS
+    print("📋 Baixando lista de IDs recentes...")
     
     payload_ids = {
         "methodName": "GetReservationsFiltered",
@@ -164,7 +151,7 @@ def executar_sincronizacao():
             "token_key": STREAMLINE_KEY,
             "token_secret": STREAMLINE_SECRET,
             "modified_since": "2024-01-01 00:00:00",
-            "return_full": False # APENAS IDs
+            "return_full": False
         }
     }
     
@@ -172,44 +159,40 @@ def executar_sincronizacao():
     try:
         r = requests.post(URL_STREAMLINE, json=payload_ids, timeout=60)
         dados = r.json()
-        
-        # O debug mostrou que vem em data -> confirmation_id (lista)
         if 'data' in dados and 'confirmation_id' in dados['data']:
             todos_ids = dados['data']['confirmation_id']
-        else:
-            print(f"❌ Estrutura inesperada: {dados.keys()}")
-            return
-
+        elif 'Response' in dados:
+             # Tenta achar lista em outros lugares
+             todos_ids = dados['Response'].get('data', {}).get('confirmation_id', [])
     except Exception as e:
-        print(f"❌ Erro fatal ao buscar IDs: {e}")
+        print(f"❌ Erro fatal: {e}")
         return
 
     total = len(todos_ids)
-    print(f"✅ Encontrados {total} IDs para processar.")
+    print(f"✅ Encontrados {total} IDs. Iniciando processamento...")
     
     if total == 0: return
 
-    # 2. PROCESSAR EM LOTES DE 20 (Para não travar)
-    tamanho_lote = 20
+    # 2. PROCESSAR UM POR UM
+    sucesso = 0
     
-    for i in range(0, total, tamanho_lote):
-        lote_ids = todos_ids[i : i + tamanho_lote]
-        print(f"\n📦 Processando lote {i} a {i+len(lote_ids)} de {total}...")
+    for i, res_id in enumerate(todos_ids):
+        # Feedback visual
+        print(f"[{i+1}/{total}] Processando ID {res_id}...", end="")
         
-        # Baixa detalhes só desses 20
-        reservas_detalhadas = baixar_detalhes_em_lote(lote_ids)
+        detalhes = baixar_reserva_individual(res_id)
         
-        if not reservas_detalhadas:
-            print("   ⚠️ Lote vazio ou erro de download.")
-            continue
+        if detalhes:
+            upsert_reserva(detalhes[0])
+            print(" ✅ Salvo!")
+            sucesso += 1
+        else:
+            print(" ⚠️ Vazio.")
             
-        # Salva no Notion
-        for reserva in reservas_detalhadas:
-            upsert_reserva(reserva)
-            
-        time.sleep(0.5) # Respira para não travar API
+        # Pausa muito curta para não fritar o servidor, mas rápida o suficiente
+        time.sleep(0.1)
 
-    print("\n🏁 Sincronização Finalizada!")
+    print(f"\n🏁 FIM! Processados com sucesso: {sucesso}")
 
 if __name__ == "__main__":
     executar_sincronizacao()
