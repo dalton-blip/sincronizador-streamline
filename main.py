@@ -116,19 +116,16 @@ def upsert_reserva(reserva):
         except:
             time.sleep(1)
 
-# --- O PULO DO GATO ESTÁ AQUI EMBAIXO ---
-
 def baixar_reserva_individual(res_id):
-    """Baixa UMA única reserva pelo ID, mas COM DATA para não travar"""
+    """Baixa UMA única reserva pelo ID usando a data RECENTE para não travar"""
     payload = {
         "methodName": "GetReservationsFiltered",
         "params": {
             "token_key": STREAMLINE_KEY,
             "token_secret": STREAMLINE_SECRET,
             "confirmation_id": res_id, 
-            # TRUQUE MÁGICO: Mesmo buscando ID, precisamos limitar a busca por data
-            # Coloquei uma data antiga (2010) para garantir que pegue tudo, mas filtre o banco
-            "modified_since": "2010-01-01 00:00:00", 
+            # AQUI ESTAVA O ERRO: Mudei de 2010 para 2024
+            "modified_since": "2024-01-01 00:00:00", 
             "return_full": True
         }
     }
@@ -136,9 +133,9 @@ def baixar_reserva_individual(res_id):
         r = requests.post(URL_STREAMLINE, json=payload, timeout=30)
         dados = r.json()
         
-        # Verificação extra de erro 10k
-        if isinstance(dados, dict) and 'status' in dados and dados['status'].get('code') == 'E0105':
-             # Se ainda der erro, tenta sem o modified_since mas com date_type (Plano B)
+        # Se der erro, vamos imprimir o motivo real
+        if isinstance(dados, dict) and 'status' in dados and dados['status'].get('code') != '0':
+             print(f" (Erro API: {dados['status'].get('description')})", end="")
              return []
 
         if 'data' in dados and 'reservations' in dados['data']:
@@ -146,13 +143,12 @@ def baixar_reserva_individual(res_id):
         elif 'Response' in dados:
             return dados['Response'].get('data', [])
         return []
-    except:
+    except Exception as e:
+        print(f" (Erro Conexão: {e})", end="")
         return []
 
 def executar_sincronizacao():
-    print("🚀 Sincronização Final (Com Correção de Data)...")
-    
-    print("📋 Baixando lista de IDs recentes (2024+)...")
+    print("🚀 Sincronização Final (Filtro 2024 Ajustado)...")
     
     # Busca IDs recentes
     payload_ids = {
@@ -187,7 +183,7 @@ def executar_sincronizacao():
     
     # Processa um por um
     for i, res_id in enumerate(todos_ids):
-        # Feedback a cada 1 (para ver correndo)
+        # Feedback a cada 1
         print(f"[{i+1}/{total}] ID {res_id}: ", end="")
         
         detalhes = baixar_reserva_individual(res_id)
@@ -197,7 +193,7 @@ def executar_sincronizacao():
             print("✅ Salvo!")
             sucesso += 1
         else:
-            print("⚠️ Vazio (API não retornou detalhes)")
+            print("⚠️ Falha.")
             vazios += 1
             
         time.sleep(0.1)
