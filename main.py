@@ -30,7 +30,6 @@ def parse_dt_robusto(data_str):
     try:
         data_str = str(data_str).strip()
         if data_str.startswith("0000-00-00"): return None
-        # Lista de formatos possíveis
         formatos = ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%m/%d/%Y %H:%M:%S", "%m/%d/%Y"]
         for fmt in formatos:
             try: return datetime.strptime(data_str, fmt)
@@ -112,36 +111,27 @@ def upsert_reserva(reserva):
                 res = requests.post(f"{URL_NOTION}/pages", json=payload, headers=HEADERS_NOTION)
             
             if res.status_code == 429:
-                print("⏳ Notion pediu pausa... esperando 5s.")
                 time.sleep(5)
                 continue
-            
-            # Sucesso
             break
-        except Exception as e:
-            print(f"Erro no Notion: {e}")
+        except:
             break
 
 def executar_sincronizacao():
-    print("🚀 Iniciando Sincronização MÊS a MÊS (Formato Americano)...")
+    print("🚀 Sincronização MÊS a MÊS (Filtro 'Arrival')...")
     
     if not STREAMLINE_KEY:
-        print("❌ ERRO: Chave STREAMLINE_KEY não encontrada.")
+        print("❌ ERRO: Chaves não encontradas.")
         return
 
-    # Vamos de 2015 até 2027
-    anos = range(2015, 2028) 
-
+    anos = range(2023, 2026) # Começando mais recente para testar rápido
     total_geral = 0
 
     for ano in anos:
         print(f"\n📂 Ano {ano} -------------------------")
         
-        # Loop pelos 12 meses
         for mes in range(1, 13):
             ultimo_dia = calendar.monthrange(ano, mes)[1]
-            
-            # FORMATO AMERICANO: MM/DD/YYYY
             dt_inicio = f"{mes:02d}/01/{ano}"
             dt_fim = f"{mes:02d}/{ultimo_dia}/{ano}"
             
@@ -152,24 +142,23 @@ def executar_sincronizacao():
                 "params": {
                     "token_key": STREAMLINE_KEY,
                     "token_secret": STREAMLINE_SECRET,
-                    "start_date": dt_inicio, # Data de check-in
+                    "start_date": dt_inicio,
                     "end_date": dt_fim,
+                    "date_type": "arrival", # <--- O SEGREDO ESTÁ AQUI
                     "return_full": True
                 }
             }
 
             try:
                 response = requests.post(URL_STREAMLINE, json=payload, timeout=60)
-                
-                # Tratamento de erro de JSON vazio
                 try:
                     dados = response.json()
                 except:
-                    print("❌ Erro JSON (vazio ou inválido)")
+                    print("❌ JSON Inválido")
                     continue
 
                 if isinstance(dados, dict) and 'status' in dados and dados['status'].get('code') == 'E0105':
-                    print("⚠️ Erro 10k (Improvável neste modo)")
+                    print("⚠️ Erro 10k (Filtro Ignorado)")
                     continue
 
                 lista_reservas = []
@@ -185,14 +174,12 @@ def executar_sincronizacao():
                 if qtd > 0:
                     for r in lista_reservas:
                         upsert_reserva(r)
-                        # Pequena pausa para não travar o Notion
                         time.sleep(0.05) 
 
             except Exception as e:
-                print(f"❌ Erro de conexão: {e}")
-                time.sleep(1)
+                print(f"❌ Erro: {e}")
 
-    print(f"\n✅ FIM! Total processado: {total_geral}")
+    print(f"\n✅ FIM! Total: {total_geral}")
 
 if __name__ == "__main__":
     executar_sincronizacao()
