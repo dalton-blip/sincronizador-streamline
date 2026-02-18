@@ -22,7 +22,7 @@ HEADERS_NOTION = {
     "Notion-Version": "2022-06-28"
 }
 
-# --- FUNÇÕES ---
+# --- FUNÇÕES DE DATA E NOTION ---
 
 def parse_dt_robusto(data_str):
     if not data_str: return None
@@ -101,88 +101,115 @@ def upsert_reserva(reserva):
     page_id = buscar_pagina_notion(res_id)
     payload = {"properties": props}
     
-    while True:
+    # Tentativa de salvamento com Retry
+    for tentativa in range(3):
         try:
             if page_id:
                 res = requests.patch(f"{URL_NOTION}/pages/{page_id}", json=payload, headers=HEADERS_NOTION)
+                print(f"   🔄 Atualizada: {res_id}")
             else:
                 payload["parent"] = {"database_id": NOTION_DATABASE_ID}
                 res = requests.post(f"{URL_NOTION}/pages", json=payload, headers=HEADERS_NOTION)
+                print(f"   ✨ Criada: {res_id}")
             
-            if res.status_code == 429:
-                time.sleep(5)
+            if res.status_code == 429: # Rate limit
+                time.sleep(2)
                 continue
             break
         except:
-            break
+            time.sleep(1)
+
+# --- FUNÇÕES CORE DO STREAMLINE ---
+
+def baixar_detalhes_em_lote(lista_ids):
+    """Pega uma lista de IDs e baixa os detalhes usando GetReservationsFiltered filtrando por ID"""
+    
+    # Transforma a lista [123, 124] em string "123,124" (se API pedir string)
+    # Mas o Streamline geralmente aceita array no JSON. Vamos tentar array.
+    
+    payload = {
+        "methodName": "GetReservationsFiltered",
+        "params": {
+            "token_key": STREAMLINE_KEY,
+            "token_secret": STREAMLINE_SECRET,
+            "confirmation_id": lista_ids, # O TRUQUE: Filtrar por estes IDs específicos
+            "return_full": True
+        }
+    }
+    
+    try:
+        r = requests.post(URL_STREAMLINE, json=payload, timeout=60)
+        dados = r.json()
+        
+        reservas = []
+        if 'data' in dados and 'reservations' in dados['data']:
+            reservas = dados['data']['reservations']
+        elif 'Response' in dados:
+            reservas = dados['Response'].get('data', [])
+            
+        return reservas
+    except Exception as e:
+        print(f"❌ Erro ao baixar lote: {e}")
+        return []
 
 def executar_sincronizacao():
-    print("🚀 Sincronização via PAGINAÇÃO (Página por Página)...")
+    print("🚀 Sincronização HÍBRIDA (IDs -> Detalhes)...")
     
-    if not STREAMLINE_KEY:
-        print("❌ ERRO: Chaves não encontradas.")
+    # 1. PEGAR A LISTA DE IDS (Isso é rápido e leve)
+    print("📋 Baixando lista de IDs recentes (Desde 2024)...")
+    
+    payload_ids = {
+        "methodName": "GetReservationsFiltered",
+        "params": {
+            "token_key": STREAMLINE_KEY,
+            "token_secret": STREAMLINE_SECRET,
+            "modified_since": "2024-01-01 00:00:00",
+            "return_full": False # APENAS IDs
+        }
+    }
+    
+    todos_ids = []
+    try:
+        r = requests.post(URL_STREAMLINE, json=payload_ids, timeout=60)
+        dados = r.json()
+        
+        # O debug mostrou que vem em data -> confirmation_id (lista)
+        if 'data' in dados and 'confirmation_id' in dados['data']:
+            todos_ids = dados['data']['confirmation_id']
+        else:
+            print(f"❌ Estrutura inesperada: {dados.keys()}")
+            return
+
+    except Exception as e:
+        print(f"❌ Erro fatal ao buscar IDs: {e}")
         return
 
-    page = 1
-    total_processado = 0
-    limit = 50 # Baixa quantidade para não estressar a API
+    total = len(todos_ids)
+    print(f"✅ Encontrados {total} IDs para processar.")
+    
+    if total == 0: return
 
-    while True:
-        print(f"📖 Lendo Página {page}...", end="")
-
-        payload = {
-            "methodName": "GetReservationsFiltered",
-            "params": {
-                "token_key": STREAMLINE_KEY,
-                "token_secret": STREAMLINE_SECRET,
-                "return_full": True,
-                "limit": limit,
-                "p": page # Aqui está o segredo!
-            }
-        }
-
-        try:
-            response = requests.post(URL_STREAMLINE, json=payload, timeout=60)
+    # 2. PROCESSAR EM LOTES DE 20 (Para não travar)
+    tamanho_lote = 20
+    
+    for i in range(0, total, tamanho_lote):
+        lote_ids = todos_ids[i : i + tamanho_lote]
+        print(f"\n📦 Processando lote {i} a {i+len(lote_ids)} de {total}...")
+        
+        # Baixa detalhes só desses 20
+        reservas_detalhadas = baixar_detalhes_em_lote(lote_ids)
+        
+        if not reservas_detalhadas:
+            print("   ⚠️ Lote vazio ou erro de download.")
+            continue
             
-            try:
-                dados = response.json()
-            except:
-                print(" ❌ Erro JSON. Tentando próxima página...")
-                page += 1
-                continue
-
-            # Se der erro 10k aqui, é porque o 'limit' foi ignorado, mas com 50 deve passar
-            if isinstance(dados, dict) and 'status' in dados and dados['status'].get('code') == 'E0105':
-                print(" ⚠️ Erro de limite. Diminuindo ritmo.")
-                time.sleep(2)
-                continue
-
-            lista_reservas = []
-            if 'data' in dados and 'reservations' in dados['data']:
-                lista_reservas = dados['data']['reservations']
-            elif 'Response' in dados:
-                lista_reservas = dados['Response'].get('data', [])
+        # Salva no Notion
+        for reserva in reservas_detalhadas:
+            upsert_reserva(reserva)
             
-            qtd = len(lista_reservas)
-            print(f" 📦 {qtd} reservas encontradas.")
+        time.sleep(0.5) # Respira para não travar API
 
-            if qtd == 0:
-                print("🏁 Chegamos ao fim! Nenhuma reserva nesta página.")
-                break
-
-            for r in lista_reservas:
-                upsert_reserva(r)
-                # print(".", end="", flush=True) # Feedback visual opcional
-            
-            total_processado += qtd
-            page += 1
-            time.sleep(0.5) # Respira
-
-        except Exception as e:
-            print(f"❌ Erro fatal: {e}")
-            time.sleep(5) # Espera e tenta de novo
-
-    print(f"\n✅ FIM! Total processado: {total_processado}")
+    print("\n🏁 Sincronização Finalizada!")
 
 if __name__ == "__main__":
     executar_sincronizacao()
