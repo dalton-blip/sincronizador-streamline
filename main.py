@@ -2,7 +2,6 @@ import requests
 import json
 import os
 import time
-import calendar
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -118,68 +117,72 @@ def upsert_reserva(reserva):
             break
 
 def executar_sincronizacao():
-    print("🚀 Sincronização MÊS a MÊS (Filtro 'Arrival')...")
+    print("🚀 Sincronização via PAGINAÇÃO (Página por Página)...")
     
     if not STREAMLINE_KEY:
         print("❌ ERRO: Chaves não encontradas.")
         return
 
-    anos = range(2023, 2026) # Começando mais recente para testar rápido
-    total_geral = 0
+    page = 1
+    total_processado = 0
+    limit = 50 # Baixa quantidade para não estressar a API
 
-    for ano in anos:
-        print(f"\n📂 Ano {ano} -------------------------")
-        
-        for mes in range(1, 13):
-            ultimo_dia = calendar.monthrange(ano, mes)[1]
-            dt_inicio = f"{mes:02d}/01/{ano}"
-            dt_fim = f"{mes:02d}/{ultimo_dia}/{ano}"
-            
-            print(f"   📅 {dt_inicio} a {dt_fim} -> ", end="")
+    while True:
+        print(f"📖 Lendo Página {page}...", end="")
 
-            payload = {
-                "methodName": "GetReservationsFiltered",
-                "params": {
-                    "token_key": STREAMLINE_KEY,
-                    "token_secret": STREAMLINE_SECRET,
-                    "start_date": dt_inicio,
-                    "end_date": dt_fim,
-                    "date_type": "arrival", # <--- O SEGREDO ESTÁ AQUI
-                    "return_full": True
-                }
+        payload = {
+            "methodName": "GetReservationsFiltered",
+            "params": {
+                "token_key": STREAMLINE_KEY,
+                "token_secret": STREAMLINE_SECRET,
+                "return_full": True,
+                "limit": limit,
+                "p": page # Aqui está o segredo!
             }
+        }
 
+        try:
+            response = requests.post(URL_STREAMLINE, json=payload, timeout=60)
+            
             try:
-                response = requests.post(URL_STREAMLINE, json=payload, timeout=60)
-                try:
-                    dados = response.json()
-                except:
-                    print("❌ JSON Inválido")
-                    continue
+                dados = response.json()
+            except:
+                print(" ❌ Erro JSON. Tentando próxima página...")
+                page += 1
+                continue
 
-                if isinstance(dados, dict) and 'status' in dados and dados['status'].get('code') == 'E0105':
-                    print("⚠️ Erro 10k (Filtro Ignorado)")
-                    continue
+            # Se der erro 10k aqui, é porque o 'limit' foi ignorado, mas com 50 deve passar
+            if isinstance(dados, dict) and 'status' in dados and dados['status'].get('code') == 'E0105':
+                print(" ⚠️ Erro de limite. Diminuindo ritmo.")
+                time.sleep(2)
+                continue
 
-                lista_reservas = []
-                if 'data' in dados and 'reservations' in dados['data']:
-                    lista_reservas = dados['data']['reservations']
-                elif 'Response' in dados:
-                    lista_reservas = dados['Response'].get('data', [])
-                
-                qtd = len(lista_reservas)
-                print(f"📦 {qtd} reservas")
-                total_geral += qtd
+            lista_reservas = []
+            if 'data' in dados and 'reservations' in dados['data']:
+                lista_reservas = dados['data']['reservations']
+            elif 'Response' in dados:
+                lista_reservas = dados['Response'].get('data', [])
+            
+            qtd = len(lista_reservas)
+            print(f" 📦 {qtd} reservas encontradas.")
 
-                if qtd > 0:
-                    for r in lista_reservas:
-                        upsert_reserva(r)
-                        time.sleep(0.05) 
+            if qtd == 0:
+                print("🏁 Chegamos ao fim! Nenhuma reserva nesta página.")
+                break
 
-            except Exception as e:
-                print(f"❌ Erro: {e}")
+            for r in lista_reservas:
+                upsert_reserva(r)
+                # print(".", end="", flush=True) # Feedback visual opcional
+            
+            total_processado += qtd
+            page += 1
+            time.sleep(0.5) # Respira
 
-    print(f"\n✅ FIM! Total: {total_geral}")
+        except Exception as e:
+            print(f"❌ Erro fatal: {e}")
+            time.sleep(5) # Espera e tenta de novo
+
+    print(f"\n✅ FIM! Total processado: {total_processado}")
 
 if __name__ == "__main__":
     executar_sincronizacao()
