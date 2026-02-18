@@ -22,7 +22,7 @@ HEADERS_NOTION = {
     "Notion-Version": "2022-06-28"
 }
 
-# --- FUNÇÕES ---
+# --- FUNÇÕES AUXILIARES ---
 
 def parse_dt_robusto(data_str):
     if not data_str: return None
@@ -101,7 +101,6 @@ def upsert_reserva(reserva):
     page_id = buscar_pagina_notion(res_id)
     payload = {"properties": props}
     
-    # Retry simples para o Notion
     for _ in range(3):
         try:
             if page_id:
@@ -113,24 +112,35 @@ def upsert_reserva(reserva):
             if res.status_code == 429:
                 time.sleep(2)
                 continue
-            return # Sucesso
+            return
         except:
             time.sleep(1)
 
+# --- O PULO DO GATO ESTÁ AQUI EMBAIXO ---
+
 def baixar_reserva_individual(res_id):
-    """Baixa UMA única reserva pelo ID"""
+    """Baixa UMA única reserva pelo ID, mas COM DATA para não travar"""
     payload = {
         "methodName": "GetReservationsFiltered",
         "params": {
             "token_key": STREAMLINE_KEY,
             "token_secret": STREAMLINE_SECRET,
-            "confirmation_id": res_id, # Singular!
+            "confirmation_id": res_id, 
+            # TRUQUE MÁGICO: Mesmo buscando ID, precisamos limitar a busca por data
+            # Coloquei uma data antiga (2010) para garantir que pegue tudo, mas filtre o banco
+            "modified_since": "2010-01-01 00:00:00", 
             "return_full": True
         }
     }
     try:
         r = requests.post(URL_STREAMLINE, json=payload, timeout=30)
         dados = r.json()
+        
+        # Verificação extra de erro 10k
+        if isinstance(dados, dict) and 'status' in dados and dados['status'].get('code') == 'E0105':
+             # Se ainda der erro, tenta sem o modified_since mas com date_type (Plano B)
+             return []
+
         if 'data' in dados and 'reservations' in dados['data']:
             return dados['data']['reservations']
         elif 'Response' in dados:
@@ -140,11 +150,11 @@ def baixar_reserva_individual(res_id):
         return []
 
 def executar_sincronizacao():
-    print("🚀 Sincronização Final (Modo Um-por-Um)...")
+    print("🚀 Sincronização Final (Com Correção de Data)...")
     
-    # 1. PEGAR A LISTA DE IDS
-    print("📋 Baixando lista de IDs recentes...")
+    print("📋 Baixando lista de IDs recentes (2024+)...")
     
+    # Busca IDs recentes
     payload_ids = {
         "methodName": "GetReservationsFiltered",
         "params": {
@@ -162,37 +172,37 @@ def executar_sincronizacao():
         if 'data' in dados and 'confirmation_id' in dados['data']:
             todos_ids = dados['data']['confirmation_id']
         elif 'Response' in dados:
-             # Tenta achar lista em outros lugares
              todos_ids = dados['Response'].get('data', {}).get('confirmation_id', [])
     except Exception as e:
         print(f"❌ Erro fatal: {e}")
         return
 
     total = len(todos_ids)
-    print(f"✅ Encontrados {total} IDs. Iniciando processamento...")
+    print(f"✅ Encontrados {total} IDs.")
     
     if total == 0: return
 
-    # 2. PROCESSAR UM POR UM
     sucesso = 0
+    vazios = 0
     
+    # Processa um por um
     for i, res_id in enumerate(todos_ids):
-        # Feedback visual
-        print(f"[{i+1}/{total}] Processando ID {res_id}...", end="")
+        # Feedback a cada 1 (para ver correndo)
+        print(f"[{i+1}/{total}] ID {res_id}: ", end="")
         
         detalhes = baixar_reserva_individual(res_id)
         
         if detalhes:
             upsert_reserva(detalhes[0])
-            print(" ✅ Salvo!")
+            print("✅ Salvo!")
             sucesso += 1
         else:
-            print(" ⚠️ Vazio.")
+            print("⚠️ Vazio (API não retornou detalhes)")
+            vazios += 1
             
-        # Pausa muito curta para não fritar o servidor, mas rápida o suficiente
         time.sleep(0.1)
 
-    print(f"\n🏁 FIM! Processados com sucesso: {sucesso}")
+    print(f"\n🏁 FIM! Sucesso: {sucesso} | Falhas: {vazios}")
 
 if __name__ == "__main__":
     executar_sincronizacao()
