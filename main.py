@@ -101,64 +101,88 @@ def upsert_reserva(reserva):
     page_id = buscar_pagina_notion(res_id)
     payload = {"properties": props}
     
-    if page_id:
-        requests.patch(f"{URL_NOTION}/pages/{page_id}", json=payload, headers=HEADERS_NOTION)
-        print(f"🔄 Atualizado: {res_id}")
-    else:
-        payload["parent"] = {"database_id": NOTION_DATABASE_ID}
-        requests.post(f"{URL_NOTION}/pages", json=payload, headers=HEADERS_NOTION)
-        print(f"✨ Criado: {res_id}")
+    # Tratamento de erro 429 (Rate Limit do Notion)
+    while True:
+        if page_id:
+            res = requests.patch(f"{URL_NOTION}/pages/{page_id}", json=payload, headers=HEADERS_NOTION)
+        else:
+            payload["parent"] = {"database_id": NOTION_DATABASE_ID}
+            res = requests.post(f"{URL_NOTION}/pages", json=payload, headers=HEADERS_NOTION)
+        
+        if res.status_code == 429:
+            print("⏳ Notion pediu pausa... esperando 5 segundos.")
+            time.sleep(5)
+            continue
+        
+        if page_id:
+            # print(f"🔄 Atualizado: {res_id}") # Silencioso para não poluir
+            pass
+        else:
+            print(f"✨ Criado: {res_id} ({dt_ci})")
+        break
 
 def executar_sincronizacao():
-    print("🚀 Iniciando Sincronização (Modo DEBUG)...")
+    print("🚀 Iniciando Sincronização Ano a Ano (2015-2027)...")
     
-    # Check de sanidade das chaves
     if not STREAMLINE_KEY:
-        print("❌ ERRO: Chave STREAMLINE_KEY não encontrada no .env")
+        print("❌ ERRO: Chave STREAMLINE_KEY não encontrada.")
         return
 
-    data_historico = "2015-01-01 00:00:00"
+    # VAMOS PERCORRER ANO POR ANO
+    anos = range(2015, 2027) # De 2015 até 2026
 
-    payload = {
-        "methodName": "GetReservationsFiltered",
-        "params": {
-            "token_key": STREAMLINE_KEY,
-            "token_secret": STREAMLINE_SECRET,
-            "return_full": True, 
-            "modified_since": data_historico
+    total_geral = 0
+
+    for ano in anos:
+        print(f"\n📅 Buscando reservas de {ano}...")
+        
+        payload = {
+            "methodName": "GetReservationsFiltered",
+            "params": {
+                "token_key": STREAMLINE_KEY,
+                "token_secret": STREAMLINE_SECRET,
+                "start_date": f"{ano}-01-01",
+                "end_date": f"{ano}-12-31",
+                "return_full": True
+            }
         }
-    }
 
-    try:
-        response = requests.post(URL_STREAMLINE, json=payload, timeout=120)
-        print(f"📡 Status Code Streamline: {response.status_code}")
-        
         try:
-            dados = response.json()
-            # IMPRIMIR O ERRO REAL
-            print(f"🔍 RESPOSTA BRUTA: {str(dados)[:600]}")
-        except:
-            print(f"❌ Erro ao ler JSON: {response.text}")
-            return
+            response = requests.post(URL_STREAMLINE, json=payload, timeout=120)
+            
+            try:
+                dados = response.json()
+            except:
+                print(f"❌ Erro JSON no ano {ano}: {response.text}")
+                continue
 
-        lista_reservas = []
-        if 'data' in dados and 'reservations' in dados['data']:
-            lista_reservas = dados['data']['reservations']
-        elif 'Response' in dados:
-            lista_reservas = dados['Response'].get('data', [])
-        
-        print(f"📦 Total de reservas encontradas: {len(lista_reservas)}")
+            if isinstance(dados, dict) and 'status' in dados and dados['status'].get('code') == 'E0105':
+                print(f"⚠️ Ano {ano} tem mais de 10k reservas! (Isso é raro, verifique).")
+                continue
 
-        count = 0
-        for r in lista_reservas:
-            upsert_reserva(r)
-            count += 1
-            if count % 10 == 0: print(f"--- Processados {count} ---")
+            lista_reservas = []
+            if 'data' in dados and 'reservations' in dados['data']:
+                lista_reservas = dados['data']['reservations']
+            elif 'Response' in dados:
+                lista_reservas = dados['Response'].get('data', [])
+            
+            qtd = len(lista_reservas)
+            print(f"📦 Encontradas em {ano}: {qtd}")
+            total_geral += qtd
 
-        print("✅ Fim da execução.")
+            count = 0
+            for r in lista_reservas:
+                upsert_reserva(r)
+                count += 1
+                if count % 20 == 0: print(f"   Processados {count}/{qtd}")
+                # Pausa estratégica para o Notion não bloquear
+                time.sleep(0.15) 
 
-    except Exception as e:
-        print(f"❌ Erro fatal de conexão: {e}")
+        except Exception as e:
+            print(f"❌ Erro no ano {ano}: {e}")
+            time.sleep(2) # Espera um pouco antes de tentar o próximo ano
+
+    print(f"\n✅ Fim da execução! Total processado: {total_geral}")
 
 if __name__ == "__main__":
     executar_sincronizacao()
