@@ -2,7 +2,6 @@ import requests
 import json
 import os
 import time
-import calendar
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -67,10 +66,17 @@ def upsert_reserva(reserva):
     res_id = str(reserva.get('confirmation_id'))
     if not res_id: return
     
+    # Datas
     dt_criacao = parse_dt_robusto(reserva.get('creation_date'))
     dt_ci = parse_dt_robusto(reserva.get('startdate') or reserva.get('start_date'))
     dt_co = parse_dt_robusto(reserva.get('enddate') or reserva.get('end_date'))
     
+    # --- FILTRO DE SEGURANÇA 2026 ---
+    # Só salva se o check-in for em 2026
+    if dt_ci and dt_ci.year != 2026:
+        # print(f"Ignorando ano {dt_ci.year}") # Silencioso
+        return
+
     nome = f"{reserva.get('first_name', '')} {reserva.get('last_name', '')}".strip()
     status_visual = gerar_status_visual(reserva.get('type_name', '---'), reserva.get('status_code'))
     state_binario = obter_estado_binario(reserva.get('status_code'))
@@ -102,14 +108,16 @@ def upsert_reserva(reserva):
     page_id = buscar_pagina_notion(res_id)
     payload = {"properties": props}
     
-    # Tentativa com retry
+    # Retry Notion
     for _ in range(3):
         try:
             if page_id:
                 res = requests.patch(f"{URL_NOTION}/pages/{page_id}", json=payload, headers=HEADERS_NOTION)
+                print(f"   🔄 {res_id} (Atualizada)")
             else:
                 payload["parent"] = {"database_id": NOTION_DATABASE_ID}
                 res = requests.post(f"{URL_NOTION}/pages", json=payload, headers=HEADERS_NOTION)
+                print(f"   ✨ {res_id} (Criada)")
             
             if res.status_code == 429:
                 time.sleep(2)
@@ -119,78 +127,68 @@ def upsert_reserva(reserva):
             time.sleep(1)
 
 def executar_sincronizacao():
-    print("🚀 Sincronização MÊS A MÊS (2024-2026)...")
+    print("🚀 TESTE 2026 (Paginação + Modified Since)...")
     
-    # Loop de Anos
-    for ano in range(2024, 2027):
-        print(f"\n📂 Processando ANO {ano} ------------------")
-        
-        # Loop de Meses
-        for mes in range(1, 13):
-            # Define o último dia do mês
-            ultimo_dia = calendar.monthrange(ano, mes)[1]
-            
-            # Formato ISO: YYYY-MM-DD (Confirmado pelo Debug que funciona)
-            dt_inicio = f"{ano}-{mes:02d}-01"
-            dt_fim = f"{ano}-{mes:02d}-{ultimo_dia}"
-            
-            print(f"   📅 Mês {mes:02d} ({dt_inicio} a {dt_fim}): ", end="")
+    page = 1
+    total_processado = 0
+    limit = 50 
 
-            payload = {
-                "methodName": "GetReservationsFiltered",
-                "params": {
-                    "token_key": STREAMLINE_KEY,
-                    "token_secret": STREAMLINE_SECRET,
-                    "start_date": dt_inicio,
-                    "end_date": dt_fim,
-                    "date_type": "arrival", # Filtra pela chegada (Check-in)
-                    "return_full": True     # Traz detalhes completos
-                }
+    while True:
+        print(f"\n📖 Lendo Página {page} (Busca Modificados em 2026)...")
+
+        payload = {
+            "methodName": "GetReservationsFiltered",
+            "params": {
+                "token_key": STREAMLINE_KEY,
+                "token_secret": STREAMLINE_SECRET,
+                "return_full": True, # Queremos detalhes!
+                "limit": limit,      # De 50 em 50 para não travar
+                "p": page,
+                "modified_since": "2026-01-01 00:00:00" # <--- O ÚNICO FILTRO QUE FUNCIONA
             }
+        }
 
+        try:
+            response = requests.post(URL_STREAMLINE, json=payload, timeout=60)
+            
             try:
-                # Timeout aumentado para 90s
-                response = requests.post(URL_STREAMLINE, json=payload, timeout=90)
-                
-                try:
-                    dados = response.json()
-                except:
-                    print("❌ Erro JSON/Timeout API.")
-                    continue
+                dados = response.json()
+            except:
+                print("❌ Erro JSON. Tentando próxima página...")
+                page += 1
+                continue
 
-                # Checa erro de limite (10k)
-                if isinstance(dados, dict) and 'status' in dados and dados['status'].get('code') == 'E0105':
-                    print("⚠️ Limite 10k atingido (Mês muito cheio).")
-                    # Aqui poderíamos quebrar em quinzenas, mas vamos torcer para passar
-                    continue
+            # Se der erro 10k aqui, a API é muito mal feita, mas com paginação deve passar
+            if isinstance(dados, dict) and 'status' in dados and dados['status'].get('code') == 'E0105':
+                print("⚠️ Erro de limite 10k mesmo com paginação. API instável.")
+                time.sleep(5)
+                continue
 
-                lista_reservas = []
-                if 'data' in dados and 'reservations' in dados['data']:
-                    lista_reservas = dados['data']['reservations']
-                elif 'Response' in dados:
-                    lista_reservas = dados['Response'].get('data', [])
-                
-                qtd = len(lista_reservas)
-                print(f"📦 {qtd} reservas encontradas.")
+            lista_reservas = []
+            if 'data' in dados and 'reservations' in dados['data']:
+                lista_reservas = dados['data']['reservations']
+            elif 'Response' in dados:
+                lista_reservas = dados['Response'].get('data', [])
+            
+            qtd = len(lista_reservas)
+            print(f"📦 {qtd} reservas recebidas.")
 
-                if qtd > 0:
-                    count_salvo = 0
-                    for r in lista_reservas:
-                        upsert_reserva(r)
-                        count_salvo += 1
-                        # Feedback visual simples (.)
-                        if count_salvo % 5 == 0:
-                            print(".", end="", flush=True)
-                    print(f" ✅ Concluído.")
-                
-                # Pausa para respirar entre meses
-                time.sleep(1)
+            if qtd == 0:
+                print("🏁 Fim das páginas. Tudo sincronizado!")
+                break
 
-            except Exception as e:
-                print(f"❌ Erro Conexão: {e}")
-                time.sleep(2)
+            for r in lista_reservas:
+                upsert_reserva(r)
+            
+            total_processado += qtd
+            page += 1
+            time.sleep(1) # Respira
 
-    print("\n🏁 FIM! Execução completa.")
+        except Exception as e:
+            print(f"❌ Erro fatal: {e}")
+            time.sleep(5)
+
+    print(f"\n✅ FIM! Total analisado: {total_processado}")
 
 if __name__ == "__main__":
     executar_sincronizacao()
