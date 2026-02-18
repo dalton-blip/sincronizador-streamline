@@ -2,6 +2,7 @@ import requests
 import json
 import os
 import time
+import calendar
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -29,6 +30,7 @@ def parse_dt_robusto(data_str):
     try:
         data_str = str(data_str).strip()
         if data_str.startswith("0000-00-00"): return None
+        # Lista de formatos possíveis
         formatos = ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%m/%d/%Y %H:%M:%S", "%m/%d/%Y"]
         for fmt in formatos:
             try: return datetime.strptime(data_str, fmt)
@@ -101,88 +103,96 @@ def upsert_reserva(reserva):
     page_id = buscar_pagina_notion(res_id)
     payload = {"properties": props}
     
-    # Tratamento de erro 429 (Rate Limit do Notion)
     while True:
-        if page_id:
-            res = requests.patch(f"{URL_NOTION}/pages/{page_id}", json=payload, headers=HEADERS_NOTION)
-        else:
-            payload["parent"] = {"database_id": NOTION_DATABASE_ID}
-            res = requests.post(f"{URL_NOTION}/pages", json=payload, headers=HEADERS_NOTION)
-        
-        if res.status_code == 429:
-            print("⏳ Notion pediu pausa... esperando 5 segundos.")
-            time.sleep(5)
-            continue
-        
-        if page_id:
-            # print(f"🔄 Atualizado: {res_id}") # Silencioso para não poluir
-            pass
-        else:
-            print(f"✨ Criado: {res_id} ({dt_ci})")
-        break
+        try:
+            if page_id:
+                res = requests.patch(f"{URL_NOTION}/pages/{page_id}", json=payload, headers=HEADERS_NOTION)
+            else:
+                payload["parent"] = {"database_id": NOTION_DATABASE_ID}
+                res = requests.post(f"{URL_NOTION}/pages", json=payload, headers=HEADERS_NOTION)
+            
+            if res.status_code == 429:
+                print("⏳ Notion pediu pausa... esperando 5s.")
+                time.sleep(5)
+                continue
+            
+            # Sucesso
+            break
+        except Exception as e:
+            print(f"Erro no Notion: {e}")
+            break
 
 def executar_sincronizacao():
-    print("🚀 Iniciando Sincronização Ano a Ano (2015-2027)...")
+    print("🚀 Iniciando Sincronização MÊS a MÊS (Formato Americano)...")
     
     if not STREAMLINE_KEY:
         print("❌ ERRO: Chave STREAMLINE_KEY não encontrada.")
         return
 
-    # VAMOS PERCORRER ANO POR ANO
-    anos = range(2015, 2027) # De 2015 até 2026
+    # Vamos de 2015 até 2027
+    anos = range(2015, 2028) 
 
     total_geral = 0
 
     for ano in anos:
-        print(f"\n📅 Buscando reservas de {ano}...")
+        print(f"\n📂 Ano {ano} -------------------------")
         
-        payload = {
-            "methodName": "GetReservationsFiltered",
-            "params": {
-                "token_key": STREAMLINE_KEY,
-                "token_secret": STREAMLINE_SECRET,
-                "start_date": f"{ano}-01-01",
-                "end_date": f"{ano}-12-31",
-                "return_full": True
+        # Loop pelos 12 meses
+        for mes in range(1, 13):
+            ultimo_dia = calendar.monthrange(ano, mes)[1]
+            
+            # FORMATO AMERICANO: MM/DD/YYYY
+            dt_inicio = f"{mes:02d}/01/{ano}"
+            dt_fim = f"{mes:02d}/{ultimo_dia}/{ano}"
+            
+            print(f"   📅 {dt_inicio} a {dt_fim} -> ", end="")
+
+            payload = {
+                "methodName": "GetReservationsFiltered",
+                "params": {
+                    "token_key": STREAMLINE_KEY,
+                    "token_secret": STREAMLINE_SECRET,
+                    "start_date": dt_inicio, # Data de check-in
+                    "end_date": dt_fim,
+                    "return_full": True
+                }
             }
-        }
 
-        try:
-            response = requests.post(URL_STREAMLINE, json=payload, timeout=120)
-            
             try:
-                dados = response.json()
-            except:
-                print(f"❌ Erro JSON no ano {ano}: {response.text}")
-                continue
+                response = requests.post(URL_STREAMLINE, json=payload, timeout=60)
+                
+                # Tratamento de erro de JSON vazio
+                try:
+                    dados = response.json()
+                except:
+                    print("❌ Erro JSON (vazio ou inválido)")
+                    continue
 
-            if isinstance(dados, dict) and 'status' in dados and dados['status'].get('code') == 'E0105':
-                print(f"⚠️ Ano {ano} tem mais de 10k reservas! (Isso é raro, verifique).")
-                continue
+                if isinstance(dados, dict) and 'status' in dados and dados['status'].get('code') == 'E0105':
+                    print("⚠️ Erro 10k (Improvável neste modo)")
+                    continue
 
-            lista_reservas = []
-            if 'data' in dados and 'reservations' in dados['data']:
-                lista_reservas = dados['data']['reservations']
-            elif 'Response' in dados:
-                lista_reservas = dados['Response'].get('data', [])
-            
-            qtd = len(lista_reservas)
-            print(f"📦 Encontradas em {ano}: {qtd}")
-            total_geral += qtd
+                lista_reservas = []
+                if 'data' in dados and 'reservations' in dados['data']:
+                    lista_reservas = dados['data']['reservations']
+                elif 'Response' in dados:
+                    lista_reservas = dados['Response'].get('data', [])
+                
+                qtd = len(lista_reservas)
+                print(f"📦 {qtd} reservas")
+                total_geral += qtd
 
-            count = 0
-            for r in lista_reservas:
-                upsert_reserva(r)
-                count += 1
-                if count % 20 == 0: print(f"   Processados {count}/{qtd}")
-                # Pausa estratégica para o Notion não bloquear
-                time.sleep(0.15) 
+                if qtd > 0:
+                    for r in lista_reservas:
+                        upsert_reserva(r)
+                        # Pequena pausa para não travar o Notion
+                        time.sleep(0.05) 
 
-        except Exception as e:
-            print(f"❌ Erro no ano {ano}: {e}")
-            time.sleep(2) # Espera um pouco antes de tentar o próximo ano
+            except Exception as e:
+                print(f"❌ Erro de conexão: {e}")
+                time.sleep(1)
 
-    print(f"\n✅ Fim da execução! Total processado: {total_geral}")
+    print(f"\n✅ FIM! Total processado: {total_geral}")
 
 if __name__ == "__main__":
     executar_sincronizacao()
