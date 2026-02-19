@@ -1,89 +1,30 @@
 import requests
-import json
 import os
 import time
 from datetime import datetime
-from dotenv import load_dotenv
-
-load_dotenv()
+from notion_client import Client
 
 # --- CONFIGURAÇÕES ---
 STREAMLINE_KEY = os.getenv("STREAMLINE_KEY")
 STREAMLINE_SECRET = os.getenv("STREAMLINE_SECRET")
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
-NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
+NOTION_DB_ID = os.getenv("NOTION_DB_ID")
 
 URL_STREAMLINE = "https://web.streamlinevrs.com/api/json"
-URL_NOTION = "https://api.notion.com/v1"
 
-HEADERS_NOTION = {
-    "Authorization": f"Bearer {NOTION_TOKEN}",
-    "Content-Type": "application/json",
-    "Notion-Version": "2022-06-28"
-}
+# Inicializa Notion
+notion = Client(auth=NOTION_TOKEN)
 
-CACHE_GRUPOS = {}
+# --- CACHE (Memória para não consultar a mesma casa repetidamente) ---
+CACHE_PROPERTY_GROUPS = {}
 
 # --- FUNÇÕES ---
-
-def listar_e_mapear_grupos():
-    """Baixa e imprime os 21 grupos para conferência no terminal"""
-    print("\n--- 📑 MAPEANDO OS 21 GRUPOS DA API ---")
-    payload = {
-        "methodName": "GetRoomTypeGroupsList",
-        "params": {"token_key": STREAMLINE_KEY, "token_secret": STREAMLINE_SECRET}
-    }
-    mapping = {}
-    try:
-        r = requests.post(URL_STREAMLINE, json=payload, timeout=30)
-        dados = r.json()
-        grupos = dados.get('data', {}).get('group', [])
-        
-        if isinstance(grupos, dict): grupos = [grupos]
-        
-        for g in grupos:
-            g_id = str(g.get('id'))
-            g_nome = g.get('name')
-            mapping[g_id] = g_nome
-            print(f"ID: {g_id.ljust(6)} | Grupo: {g_nome}")
-            
-        print(f"--- ✅ {len(mapping)} grupos carregados ---\n")
-        return mapping
-    except Exception as e:
-        print(f"❌ Erro ao listar grupos: {e}")
-        return {}
-
-def extrair_property_group(r):
-    """Lógica baseada nos IDs dos 21 grupos e palavras-chave"""
-    
-    # 1. Prioridade absoluta por texto (Bolivar / San Antonio)
-    prioritarios = ["Bolivar Vacations", "San Antonio"]
-    unit_name = str(r.get('unit_name', '')).strip()
-    
-    # Busca nos campos de texto da reserva
-    for p in prioritarios:
-        for campo in ['unit_name', 'condo_type_name', 'location_name', 'resort_name']:
-            valor = str(r.get(campo, '')).lower()
-            if p.lower() in valor:
-                return p
-
-    # 2. Mapeamento pelos 21 grupos (ID vindo da reserva)
-    group_id = str(r.get('room_type_group_id', ''))
-    if group_id in CACHE_GRUPOS:
-        nome_grupo = CACHE_GRUPOS[group_id]
-        # Se o nome do grupo for genérico (ex: 4 Bedroom), tenta pegar o prefixo da casa
-        if "bedroom" in nome_grupo.lower() or "studio" in nome_grupo.lower():
-            if " - " in unit_name:
-                return unit_name.split(" - ")[0].strip()
-        return nome_grupo
-
-    # 3. Fallback
-    return r.get('condo_type_name') or "Geral"
 
 def parse_dt_robusto(data_str):
     if not data_str: return None
     try:
         data_str = str(data_str).strip()
+        if data_str.startswith("0000-00-00"): return None
         formatos = ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%m/%d/%Y %H:%M:%S", "%m/%d/%Y"]
         for fmt in formatos:
             try: return datetime.strptime(data_str, fmt)
@@ -91,73 +32,214 @@ def parse_dt_robusto(data_str):
     except: return None
     return None
 
+def formatar_iso_date(dt_obj):
+    return dt_obj.strftime("%Y-%m-%d") if dt_obj else None
+
+def obter_estado_binario(code):
+    return "CANCELLED" if str(code) == '8' else "CONFIRMED"
+
+def gerar_status_visual(tipo, code):
+    code_str = str(code)
+    suffix = "UNK"
+    if code_str == '8': suffix = "CXL"
+    elif code_str in ['2', '4']: suffix = "BKD"
+    elif code_str == '5': suffix = "OUT"
+    elif code_str == '9': suffix = "REQ"
+    
+    safe_tipo = str(tipo) if tipo else "---"
+    tipo_limpo = safe_tipo.split(' ')[0][:10]
+    return f"{tipo_limpo}-{suffix}"
+
 def buscar_pagina_notion(res_number):
-    url = f"{URL_NOTION}/databases/{NOTION_DATABASE_ID}/query"
-    payload = {"filter": {"property": "Res #", "rich_text": {"equals": str(res_number)}}}
     try:
-        response = requests.post(url, json=payload, headers=HEADERS_NOTION)
-        if response.status_code == 200:
-            results = response.json().get("results", [])
-            if results: return results[0]["id"]
-    except: pass
+        response = notion.databases.query(
+            database_id=NOTION_DB_ID,
+            filter={"property": "Res #", "rich_text": {"equals": str(res_number)}}
+        )
+        if response["results"]:
+            return response["results"][0]["id"]
+    except:
+        pass
     return None
+
+# --- CONSULTA OFICIAL DA PROPRIEDADE ---
+def buscar_grupo_oficial(unit_id):
+    """
+    1. Verifica cache.
+    2. Se não tiver, chama GetPropertyInfo.
+    3. Retorna o condo_type_group_name oficial.
+    """
+    unit_id_str = str(unit_id)
+    
+    # Se já consultamos essa casa nesta execução, retorna da memória
+    if unit_id_str in CACHE_PROPERTY_GROUPS:
+        return CACHE_PROPERTY_GROUPS[unit_id_str]
+
+    # Se não, consulta a API
+    # print(f"      🔎 Consultando API para Unit ID: {unit_id_str}") # Debug
+    payload = {
+        "methodName": "GetPropertyInfo",
+        "params": {
+            "token_key": STREAMLINE_KEY,
+            "token_secret": STREAMLINE_SECRET,
+            "unit_id": unit_id
+        }
+    }
+    
+    try:
+        # Timeout curto para não gargalar o script inteiro
+        resp = requests.post(URL_STREAMLINE, json=payload, timeout=10)
+        data = resp.json()
+        
+        info = {}
+        if 'data' in data: info = data['data']
+        elif 'Response' in data and 'data' in data['Response']: info = data['Response']['data']
+        
+        # Pega o dado oficial
+        group_name = info.get('condo_type_group_name')
+        
+        # Fallback se vier vazio
+        if not group_name:
+            group_name = info.get('location_name', '---')
+            
+        # Salva no cache
+        CACHE_PROPERTY_GROUPS[unit_id_str] = str(group_name).strip()
+        return CACHE_PROPERTY_GROUPS[unit_id_str]
+
+    except Exception as e:
+        print(f"      ⚠️ Erro ao consultar casa {unit_id}: {e}")
+        return None
 
 def upsert_reserva(reserva):
     res_id = str(reserva.get('confirmation_id'))
-    dt_ci = parse_dt_robusto(reserva.get('startdate') or reserva.get('start_date'))
+    if not res_id: return
     
-    if not dt_ci or dt_ci.year != 2026: return
+    # 1. Obter Property Group Oficial (Com Cache)
+    unit_id = reserva.get('unit_id')
+    prop_group_real = buscar_grupo_oficial(unit_id)
+    
+    # Limpeza para Notion Select (sem vírgulas)
+    if prop_group_real:
+        prop_group_clean = prop_group_real.replace(",", "").strip()[:100]
+        prop_group_payload = {"select": {"name": prop_group_clean}}
+    else:
+        prop_group_payload = {"select": None}
 
-    pg_clean = str(extrair_property_group(reserva)).replace(",", "").strip()[:100]
+    # 2. Processar outros dados
+    dt_criacao = parse_dt_robusto(reserva.get('creation_date'))
+    dt_ci = parse_dt_robusto(reserva.get('startdate') or reserva.get('start_date'))
+    dt_co = parse_dt_robusto(reserva.get('enddate') or reserva.get('end_date'))
+    
+    nome = f"{reserva.get('first_name', '')} {reserva.get('last_name', '')}".strip()
+    status_visual = gerar_status_visual(reserva.get('type_name', '---'), reserva.get('status_code'))
+    state_binario = obter_estado_binario(reserva.get('status_code'))
+    room = str(reserva.get('unit_name', 'Unknown'))
+    gst = f"{reserva.get('occupants',0)}|{reserva.get('occupants_small',0)}"
+    
+    try: total = float(reserva.get('price_total', 0))
+    except: total = 0.0
+    try: rate = float(reserva.get('price_nightly', 0))
+    except: rate = 0.0
+    try: nights = int(reserva.get('days_number', 0))
+    except: nights = 0
 
     props = {
-        "Name": {"title": [{"text": {"content": f"{reserva.get('first_name', '')} {reserva.get('last_name', '')}"[:100]}}]},
+        "Name": {"title": [{"text": {"content": nome[:100]}}]},
         "Res #": {"rich_text": [{"text": {"content": res_id}}]},
-        "Room": {"rich_text": [{"text": {"content": str(reserva.get('unit_name', ''))[:200]}}]},
-        "Property Group": {"select": {"name": pg_clean}},
-        "Total": {"number": float(reserva.get('price_total', 0) or 0)},
-        "CI": {"date": {"start": dt_ci.strftime("%Y-%m-%d")}}
+        "Status": {"select": {"name": status_visual}},
+        "State": {"select": {"name": state_binario}},
+        "NTS": {"number": nights},
+        "GST": {"rich_text": [{"text": {"content": gst}}]},
+        "Room": {"rich_text": [{"text": {"content": room[:200]}}]},
+        "Property Group": prop_group_payload, # Campo oficial
+        "Total": {"number": total},
+        "TL Rate": {"number": rate}
     }
 
+    if dt_criacao: props["Created"] = {"date": {"start": formatar_iso_date(dt_criacao)}}
+    if dt_ci: props["CI"] = {"date": {"start": formatar_iso_date(dt_ci)}}
+    if dt_co: props["CO"] = {"date": {"start": formatar_iso_date(dt_co)}}
+
+    # 3. Enviar ao Notion
     page_id = buscar_pagina_notion(res_id)
-    payload = {"properties": props}
     
-    if page_id:
-        requests.patch(f"{URL_NOTION}/pages/{page_id}", json=payload, headers=HEADERS_NOTION)
-        print(f"   🔄 {res_id} -> {pg_clean}")
-    else:
-        payload["parent"] = {"database_id": NOTION_DATABASE_ID}
-        requests.post(f"{URL_NOTION}/pages", json=payload, headers=HEADERS_NOTION)
-        print(f"   ✨ {res_id} -> {pg_clean}")
+    for _ in range(3):
+        try:
+            if page_id:
+                notion.pages.update(page_id=page_id, properties=props)
+                print(f"   🔄 {res_id} (Upd) -> {prop_group_clean}")
+            else:
+                notion.pages.create(parent={"database_id": NOTION_DB_ID}, properties=props)
+                print(f"   ✨ {res_id} (New) -> {prop_group_clean}")
+            time.sleep(0.4) 
+            return
+        except Exception as e:
+            time.sleep(1)
 
 def executar_sincronizacao():
-    global CACHE_GRUPOS
-    print("🚀 Iniciando Sincronização...")
+    print("🚀 Sincronizando (Paginação + Property Group Oficial)...")
     
-    # 1. Mapeia os 21 grupos primeiro
-    CACHE_GRUPOS = listar_e_mapear_grupos()
-
     page = 1
+    total_processado = 0
+    limit = 50 
+
     while True:
         print(f"\n📖 Lendo Página {page}...")
+
+        # Voltamos com a estrutura que funcionava
         payload = {
             "methodName": "GetReservationsFiltered",
             "params": {
                 "token_key": STREAMLINE_KEY,
                 "token_secret": STREAMLINE_SECRET,
                 "return_full": True,
-                "limit": 50,
+                "limit": limit,      
                 "p": page,
-                "modified_since": "2024-01-01 00:00:00"
+                "modified_since": "2023-01-01 00:00:00"
             }
         }
-        r = requests.post(URL_STREAMLINE, json=payload, timeout=60)
-        lista = r.json().get('data', {}).get('reservations', [])
-        if not lista: break
 
-        for res in lista: upsert_reserva(res)
-        page += 1
-        time.sleep(1)
+        try:
+            response = requests.post(URL_STREAMLINE, json=payload, timeout=60)
+            
+            try: dados = response.json()
+            except: 
+                print("❌ Erro JSON. Tentando próxima página...")
+                page += 1
+                continue
+
+            if isinstance(dados, dict) and 'status' in dados and dados['status'].get('code') == 'E0105':
+                print("⚠️ Erro de limite API. Pausando 10s...")
+                time.sleep(10)
+                continue
+
+            lista_reservas = []
+            if 'data' in dados and 'reservations' in dados['data']:
+                lista_reservas = dados['data']['reservations']
+            elif 'Response' in dados:
+                lista_reservas = dados['Response'].get('data', [])
+            
+            qtd = len(lista_reservas)
+            print(f"📦 {qtd} reservas nesta página.")
+
+            if qtd == 0:
+                print("🏁 Sincronização Finalizada (0 itens retornados na página).")
+                break
+
+            for i, r in enumerate(lista_reservas):
+                upsert_reserva(r)
+                # Pequena pausa a cada 10 para não estourar chamadas de Property Info
+                if i % 10 == 0: time.sleep(0.2)
+            
+            total_processado += qtd
+            page += 1
+            time.sleep(1) 
+
+        except Exception as e:
+            print(f"❌ Erro de conexão na página {page}: {e}")
+            time.sleep(5)
+
+    print(f"\n✅ Total Processado: {total_processado}")
 
 if __name__ == "__main__":
     executar_sincronizacao()
