@@ -22,7 +22,7 @@ HEADERS_NOTION = {
     "Notion-Version": "2022-06-28"
 }
 
-# Cache para o DNA das casas (Bolivar/San Antonio)
+# Cache para o DNA das casas (Bolivar/San Antonio/etc)
 MAPA_DNA_CASAS = {}
 
 # --- FUNÇÕES DE APOIO ---
@@ -54,7 +54,7 @@ def gerar_status_visual(tipo, code):
     tipo_limpo = str(tipo).split(' ')[0][:10]
     return f"{tipo_limpo}-{suffix}"
 
-# --- BUSCA O GRUPO ATUAL DA CASA (O "DNA") ---
+# --- BUSCA O GRUPO ATUAL DA CASA ---
 
 def buscar_dna_da_casa(unit_id):
     if not unit_id: return "Geral"
@@ -102,20 +102,19 @@ def buscar_pagina_notion(res_number):
     except: pass
     return None
 
-# --- UPSERT COMPLETO ---
+# --- UPSERT ---
 
 def upsert_reserva(reserva):
     res_id = str(reserva.get('confirmation_id'))
     dt_ci = parse_dt_robusto(reserva.get('startdate') or reserva.get('start_date'))
     
-    # Filtro focado em 2026
-    if not dt_ci or dt_ci.year != 2026: return
+    # --- NOVO FILTRO: 2024 ATÉ 2026 ---
+    if not dt_ci or dt_ci.year not in [2024, 2025, 2026]:
+        return
 
-    # Busca o DNA (Property Group Atual)
     unit_id = reserva.get('unit_id') or reserva.get('home_id')
     nome_grupo = buscar_dna_da_casa(unit_id)
 
-    # Dados da Reserva
     dt_criacao = parse_dt_robusto(reserva.get('creation_date'))
     dt_co = parse_dt_robusto(reserva.get('enddate') or reserva.get('end_date'))
     nome = f"{reserva.get('first_name', '')} {reserva.get('last_name', '')}".strip()
@@ -152,14 +151,14 @@ def upsert_reserva(reserva):
     
     if page_id:
         requests.patch(f"{URL_NOTION}/pages/{page_id}", json=payload, headers=HEADERS_NOTION)
-        print(f"   🔄 {res_id} (Upd) -> {nome_grupo}")
+        print(f"   🔄 {res_id} (Ano {dt_ci.year}) -> {nome_grupo}")
     else:
         payload["parent"] = {"database_id": NOTION_DATABASE_ID}
         requests.post(f"{URL_NOTION}/pages", json=payload, headers=HEADERS_NOTION)
-        print(f"   ✨ {res_id} (New) -> {nome_grupo}")
+        print(f"   ✨ {res_id} (Ano {dt_ci.year}) -> {nome_grupo}")
 
 def executar():
-    print("🚀 SINC TOTAL 2026 (DNA + Campos Completos)...")
+    print("🚀 SINCRONIZANDO HISTÓRICO TOTAL (2024 - 2026)...")
     page = 1
     while True:
         print(f"\n📖 Lendo Página {page}...")
@@ -171,7 +170,7 @@ def executar():
                 "return_full": True,
                 "limit": 50,
                 "p": page,
-                "modified_since": "2026-01-01 00:00:00"
+                "modified_since": "2024-01-01 00:00:00" # Começa do passado
             }
         }
         try:
@@ -182,7 +181,7 @@ def executar():
             if not reservas: break
             for res in reservas: upsert_reserva(res)
             page += 1
-            time.sleep(1)
+            time.sleep(0.5)
         except: break
 
 if __name__ == "__main__":
