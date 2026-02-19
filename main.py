@@ -1,4 +1,4 @@
-\import requests
+import requests
 import json
 import os
 import time
@@ -22,7 +22,7 @@ HEADERS_NOTION = {
     "Notion-Version": "2022-06-28"
 }
 
-# Cache para não sobrecarregar a API pesquisando a mesma casa várias vezes
+# Cache para o DNA das casas (Bolivar/San Antonio)
 MAPA_DNA_CASAS = {}
 
 # --- FUNÇÕES DE APOIO ---
@@ -54,7 +54,7 @@ def gerar_status_visual(tipo, code):
     tipo_limpo = str(tipo).split(' ')[0][:10]
     return f"{tipo_limpo}-{suffix}"
 
-# --- FUNÇÃO MESTRE: BUSCA O GRUPO ATUAL DA CASA ---
+# --- BUSCA O GRUPO ATUAL DA CASA (O "DNA") ---
 
 def buscar_dna_da_casa(unit_id):
     if not unit_id: return "Geral"
@@ -74,15 +74,12 @@ def buscar_dna_da_casa(unit_id):
         dados = r.json()
         res_data = dados.get('data', {}) or dados.get('Response', {}).get('data', {})
         
-        # Prioridade para definir o grupo
         grupo_atual = (
             res_data.get('location_resort_name') or 
             res_data.get('condo_type_group_name') or 
-            res_data.get('condo_type_name') or 
             "Geral"
         )
         
-        # Forçar nomes amigáveis para os seus grupos principais
         u_name = str(res_data.get('unit_name', '')).lower()
         if "bolivar" in u_name or "bolivar" in str(grupo_atual).lower():
             grupo_atual = "Bolivar Vacations"
@@ -105,25 +102,22 @@ def buscar_pagina_notion(res_number):
     except: pass
     return None
 
-# --- FUNÇÃO DE UPSERT (CRIA OU ATUALIZA) ---
+# --- UPSERT COMPLETO ---
 
 def upsert_reserva(reserva):
     res_id = str(reserva.get('confirmation_id'))
-    if not res_id: return
-    
-    # Datas
-    dt_criacao = parse_dt_robusto(reserva.get('creation_date'))
     dt_ci = parse_dt_robusto(reserva.get('startdate') or reserva.get('start_date'))
-    dt_co = parse_dt_robusto(reserva.get('enddate') or reserva.get('end_date'))
     
-    # --- FILTRO 2026 ---
-    if dt_ci and dt_ci.year != 2026:
-        return
+    # Filtro focado em 2026
+    if not dt_ci or dt_ci.year != 2026: return
 
-    # Busca o Grupo Atual da Casa (O segredo do Bolivar Vacations)
+    # Busca o DNA (Property Group Atual)
     unit_id = reserva.get('unit_id') or reserva.get('home_id')
     nome_grupo = buscar_dna_da_casa(unit_id)
 
+    # Dados da Reserva
+    dt_criacao = parse_dt_robusto(reserva.get('creation_date'))
+    dt_co = parse_dt_robusto(reserva.get('enddate') or reserva.get('end_date'))
     nome = f"{reserva.get('first_name', '')} {reserva.get('last_name', '')}".strip()
     status_visual = gerar_status_visual(reserva.get('type_name', '---'), reserva.get('status_code'))
     state_binario = obter_estado_binario(reserva.get('status_code'))
@@ -156,22 +150,16 @@ def upsert_reserva(reserva):
     page_id = buscar_pagina_notion(res_id)
     payload = {"properties": props}
     
-    # Loop de tentativa Notion
-    for _ in range(3):
-        try:
-            if page_id:
-                requests.patch(f"{URL_NOTION}/pages/{page_id}", json=payload, headers=HEADERS_NOTION)
-                print(f"   🔄 {res_id} ({room[:20]}) -> {nome_grupo}")
-            else:
-                payload["parent"] = {"database_id": NOTION_DATABASE_ID}
-                requests.post(f"{URL_NOTION}/pages", json=payload, headers=HEADERS_NOTION)
-                print(f"   ✨ {res_id} ({room[:20]}) -> {nome_grupo}")
-            return
-        except:
-            time.sleep(1)
+    if page_id:
+        requests.patch(f"{URL_NOTION}/pages/{page_id}", json=payload, headers=HEADERS_NOTION)
+        print(f"   🔄 {res_id} (Upd) -> {nome_grupo}")
+    else:
+        payload["parent"] = {"database_id": NOTION_DATABASE_ID}
+        requests.post(f"{URL_NOTION}/pages", json=payload, headers=HEADERS_NOTION)
+        print(f"   ✨ {res_id} (New) -> {nome_grupo}")
 
-def executar_sincronizacao():
-    print("🚀 SINC TOTAL 2026 (DNA das Casas + Todos os Campos)...")
+def executar():
+    print("🚀 SINC TOTAL 2026 (DNA + Campos Completos)...")
     page = 1
     while True:
         print(f"\n📖 Lendo Página {page}...")
@@ -187,23 +175,15 @@ def executar_sincronizacao():
             }
         }
         try:
-            response = requests.post(URL_STREAMLINE, json=payload, timeout=60)
-            dados = response.json()
+            r = requests.post(URL_STREAMLINE, json=payload, timeout=60)
+            dados = r.json()
             data_resp = dados.get('data', {}) or dados.get('Response', {}).get('data', {})
-            lista_reservas = data_resp.get('reservations', [])
-            
-            if not lista_reservas:
-                print("🏁 Fim das páginas.")
-                break
-
-            for r in lista_reservas:
-                upsert_reserva(r)
-            
+            reservas = data_resp.get('reservations', [])
+            if not reservas: break
+            for res in reservas: upsert_reserva(res)
             page += 1
-            time.sleep(0.5)
-        except Exception as e:
-            print(f"❌ Erro: {e}")
-            break
+            time.sleep(1)
+        except: break
 
 if __name__ == "__main__":
-    executar_sincronizacao()
+    executar()
