@@ -27,7 +27,6 @@ CACHE_GRUPOS = {}
 # --- FUNÇÕES ---
 
 def buscar_nomes_dos_grupos():
-    """Busca os 21 grupos que vimos na documentação (GetRoomTypeGroupsList)"""
     payload = {
         "methodName": "GetRoomTypeGroupsList",
         "params": {"token_key": STREAMLINE_KEY, "token_secret": STREAMLINE_SECRET}
@@ -42,30 +41,30 @@ def buscar_nomes_dos_grupos():
 
 def extrair_property_group(r):
     """
-    REGRA DE NEGÓCIO: Prioriza Bolivar Vacations e San Antonio.
+    NOVA LÓGICA: Procura 'Bolivar' ou 'San Antonio' em qualquer lugar da reserva.
     """
-    # Você mencionou 03, mas listou 02. Adicione o terceiro aqui se necessário.
     prioritarios = ["Bolivar Vacations", "San Antonio"]
     
-    unit_name = str(r.get('unit_name', '')).strip()
+    # 1. BUSCA EXAUSTIVA: Procura as palavras-chave em todos os campos de texto da reserva
+    # Isso resolve o caso da 'Flip Flop' que tem 'Bolivar' escondido em algum campo
+    for p in prioritarios:
+        for valor in r.values():
+            if isinstance(valor, str) and p.lower() in valor.lower():
+                return p
+
+    # 2. SE NÃO ACHOU PRIORIDADE, tenta a lógica de mapeamento por ID
     group_id = str(r.get('room_type_group_id', ''))
     api_group_name = CACHE_GRUPOS.get(group_id, "")
-    condo_name = str(r.get('condo_type_name', '')).strip()
-
-    # 1. VERIFICA PRIORIDADES (Busca o nome nos dados da reserva)
-    for p in prioritarios:
-        if (p.lower() in unit_name.lower() or 
-            p.lower() in api_group_name.lower() or 
-            p.lower() in condo_name.lower()):
-            return p
-
-    # 2. SE NÃO FOR PRIORITÁRIO, EXTRAI PELO SEPARADOR (Lógica anterior)
-    for sep in [" - ", " | ", " # ", " @ "]:
-        if sep in unit_name:
-            return unit_name.split(sep)[0].strip()
     
-    # 3. FALLBACK FINAL (Usa o nome do grupo da API ou condomínio)
-    return api_group_name or condo_name or "Geral"
+    # 3. SE O NOME DA API FOR GENÉRICO (ex: '4 Bedroom'), tenta limpar o nome da casa
+    unit_name = str(r.get('unit_name', '')).strip()
+    if api_group_name and ("bedroom" in api_group_name.lower() or "studio" in api_group_name.lower()):
+        for sep in [" - ", " | ", " # "]:
+            if sep in unit_name:
+                return unit_name.split(sep)[0].strip()
+
+    # Fallback final
+    return api_group_name or r.get('condo_type_name') or r.get('location_name') or "Geral"
 
 def parse_dt_robusto(data_str):
     if not data_str: return None
@@ -93,8 +92,10 @@ def upsert_reserva(reserva):
     res_id = str(reserva.get('confirmation_id'))
     dt_ci = parse_dt_robusto(reserva.get('startdate') or reserva.get('start_date'))
     
+    # Mantendo o filtro de 2026 para o seu teste
     if not dt_ci or dt_ci.year != 2026: return
 
+    # Aqui a nova lógica entra em ação
     pg_clean = str(extrair_property_group(reserva)).replace(",", "").strip()[:100]
 
     props = {
@@ -119,9 +120,8 @@ def upsert_reserva(reserva):
 
 def executar_sincronizacao():
     global CACHE_GRUPOS
-    print("🚀 Sincronizando (Paginação + Property Group Oficial)...")
+    print("🚀 Sincronizando (Busca Total de Prioridades)...")
     CACHE_GRUPOS = buscar_nomes_dos_grupos()
-    print(f"✅ {len(CACHE_GRUPOS)} grupos mapeados.")
 
     page = 1
     while True:
