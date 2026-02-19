@@ -22,66 +22,61 @@ HEADERS_NOTION = {
     "Notion-Version": "2022-06-28"
 }
 
-# Variável global para guardar os nomes dos grupos
 CACHE_GRUPOS = {}
 
-# --- FUNÇÕES AUXILIARES ---
+# --- FUNÇÕES ---
 
 def buscar_nomes_dos_grupos():
-    """Baixa a lista do GetRoomTypeGroupsList para traduzir IDs em nomes"""
-    print("🔍 Buscando definições de grupos no Streamline...")
+    """Busca os 21 grupos que vimos na documentação (GetRoomTypeGroupsList)"""
     payload = {
         "methodName": "GetRoomTypeGroupsList",
-        "params": {
-            "token_key": STREAMLINE_KEY,
-            "token_secret": STREAMLINE_SECRET
-        }
+        "params": {"token_key": STREAMLINE_KEY, "token_secret": STREAMLINE_SECRET}
     }
     try:
         r = requests.post(URL_STREAMLINE, json=payload, timeout=30)
         dados = r.json()
         grupos = dados.get('data', {}).get('group', [])
-        if isinstance(grupos, dict): grupos = [grupos] # Caso venha só um
-        
-        mapping = {}
-        for g in grupos:
-            mapping[str(g.get('id'))] = g.get('name')
-        return mapping
-    except:
-        return {}
+        if isinstance(grupos, dict): grupos = [grupos]
+        return {str(g.get('id')): g.get('name') for g in grupos}
+    except: return {}
+
+def extrair_property_group(r):
+    """
+    REGRA DE NEGÓCIO: Prioriza Bolivar Vacations e San Antonio.
+    """
+    # Você mencionou 03, mas listou 02. Adicione o terceiro aqui se necessário.
+    prioritarios = ["Bolivar Vacations", "San Antonio"]
+    
+    unit_name = str(r.get('unit_name', '')).strip()
+    group_id = str(r.get('room_type_group_id', ''))
+    api_group_name = CACHE_GRUPOS.get(group_id, "")
+    condo_name = str(r.get('condo_type_name', '')).strip()
+
+    # 1. VERIFICA PRIORIDADES (Busca o nome nos dados da reserva)
+    for p in prioritarios:
+        if (p.lower() in unit_name.lower() or 
+            p.lower() in api_group_name.lower() or 
+            p.lower() in condo_name.lower()):
+            return p
+
+    # 2. SE NÃO FOR PRIORITÁRIO, EXTRAI PELO SEPARADOR (Lógica anterior)
+    for sep in [" - ", " | ", " # ", " @ "]:
+        if sep in unit_name:
+            return unit_name.split(sep)[0].strip()
+    
+    # 3. FALLBACK FINAL (Usa o nome do grupo da API ou condomínio)
+    return api_group_name or condo_name or "Geral"
 
 def parse_dt_robusto(data_str):
     if not data_str: return None
     try:
         data_str = str(data_str).strip()
-        if data_str.startswith("0000-00-00"): return None
         formatos = ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%m/%d/%Y %H:%M:%S", "%m/%d/%Y"]
         for fmt in formatos:
             try: return datetime.strptime(data_str, fmt)
             except ValueError: continue
     except: return None
     return None
-
-def extrair_property_group(r):
-    """
-    Lógica priorizada:
-    1. Tenta traduzir o ID do grupo vindo da API.
-    2. Tenta quebrar o nome da unidade (Casa).
-    3. Usa o nome do condomínio.
-    """
-    # 1. Tenta pelo ID do Grupo (usando o que você achou na doc)
-    group_id = str(r.get('room_type_group_id', ''))
-    if group_id in CACHE_GRUPOS:
-        return CACHE_GRUPOS[group_id]
-
-    # 2. Tenta quebrar o nome da casa (ex: "Magic Village - 101" -> "Magic Village")
-    unit_name = str(r.get('unit_name', '')).strip()
-    for sep in [" - ", " | ", " # ", " @ "]:
-        if sep in unit_name:
-            return unit_name.split(sep)[0].strip()
-    
-    # 3. Fallback para campos nativos
-    return r.get('condo_type_name') or r.get('location_name') or "Geral"
 
 def buscar_pagina_notion(res_number):
     url = f"{URL_NOTION}/databases/{NOTION_DATABASE_ID}/query"
@@ -96,48 +91,35 @@ def buscar_pagina_notion(res_number):
 
 def upsert_reserva(reserva):
     res_id = str(reserva.get('confirmation_id'))
-    if not res_id: return
-    
     dt_ci = parse_dt_robusto(reserva.get('startdate') or reserva.get('start_date'))
-    if not dt_ci or dt_ci.year != 2026:
-        return # Só 2026 como você pediu
-
-    nome = f"{reserva.get('first_name', '')} {reserva.get('last_name', '')}".strip()
-    room = str(reserva.get('unit_name', 'Unknown'))
     
-    # Property Group Inteligente
-    pg_raw = extrair_property_group(reserva)
-    pg_clean = str(pg_raw).replace(",", "").strip()[:100]
+    if not dt_ci or dt_ci.year != 2026: return
+
+    pg_clean = str(extrair_property_group(reserva)).replace(",", "").strip()[:100]
 
     props = {
-        "Name": {"title": [{"text": {"content": nome[:100]}}]},
+        "Name": {"title": [{"text": {"content": f"{reserva.get('first_name', '')} {reserva.get('last_name', '')}"[:100]}}]},
         "Res #": {"rich_text": [{"text": {"content": res_id}}]},
-        "Status": {"select": {"name": "BKD"}}, # Simplificado para o teste
-        "Room": {"rich_text": [{"text": {"content": room[:200]}}]},
-        "Property Group": {"select": {"name": pg_clean}}, # Campo solicitado
-        "Total": {"number": float(reserva.get('price_total', 0) or 0)}
+        "Room": {"rich_text": [{"text": {"content": str(reserva.get('unit_name', ''))[:200]}}]},
+        "Property Group": {"select": {"name": pg_clean}},
+        "Total": {"number": float(reserva.get('price_total', 0) or 0)},
+        "CI": {"date": {"start": dt_ci.strftime("%Y-%m-%d")}}
     }
-
-    # Datas
-    dt_ci_str = dt_ci.strftime("%Y-%m-%d")
-    props["CI"] = {"date": {"start": dt_ci_str}}
 
     page_id = buscar_pagina_notion(res_id)
     payload = {"properties": props}
     
     if page_id:
         requests.patch(f"{URL_NOTION}/pages/{page_id}", json=payload, headers=HEADERS_NOTION)
-        print(f"   🔄 {res_id} (Atualizada) -> {pg_clean}")
+        print(f"   🔄 {res_id} Atualizada -> {pg_clean}")
     else:
         payload["parent"] = {"database_id": NOTION_DATABASE_ID}
         requests.post(f"{URL_NOTION}/pages", json=payload, headers=HEADERS_NOTION)
-        print(f"   ✨ {res_id} (Nova) -> {pg_clean}")
+        print(f"   ✨ {res_id} Criada -> {pg_clean}")
 
 def executar_sincronizacao():
     global CACHE_GRUPOS
-    print("🚀 Iniciando Teste 2026...")
-    
-    # Carrega o mapeamento de grupos antes de começar
+    print("🚀 Sincronizando (Paginação + Property Group Oficial)...")
     CACHE_GRUPOS = buscar_nomes_dos_grupos()
     print(f"✅ {len(CACHE_GRUPOS)} grupos mapeados.")
 
@@ -152,23 +134,16 @@ def executar_sincronizacao():
                 "return_full": True,
                 "limit": 50,
                 "p": page,
-                "modified_since": "2024-01-01 00:00:00" # Pega as que foram mexidas
+                "modified_since": "2024-01-01 00:00:00"
             }
         }
-        try:
-            r = requests.post(URL_STREAMLINE, json=payload, timeout=60)
-            dados = r.json()
-            lista = dados.get('data', {}).get('reservations', [])
-            if not lista: break
+        r = requests.post(URL_STREAMLINE, json=payload, timeout=60)
+        lista = r.json().get('data', {}).get('reservations', [])
+        if not lista: break
 
-            for r_item in lista:
-                upsert_reserva(r_item)
-            
-            page += 1
-            time.sleep(1)
-        except Exception as e:
-            print(f"❌ Erro: {e}")
-            break
+        for res in lista: upsert_reserva(res)
+        page += 1
+        time.sleep(1)
 
 if __name__ == "__main__":
     executar_sincronizacao()
