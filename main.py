@@ -1,12 +1,10 @@
 import requests
-import json
 import os
 import time
 from datetime import datetime
 from notion_client import Client
 
 # --- CONFIGURAÇÕES ---
-# Certifique-se que essas variáveis estão no seu arquivo .env ou no servidor
 STREAMLINE_KEY = os.getenv("STREAMLINE_KEY")
 STREAMLINE_SECRET = os.getenv("STREAMLINE_SECRET")
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
@@ -17,7 +15,10 @@ URL_STREAMLINE = "https://web.streamlinevrs.com/api/json"
 # Inicializa Notion
 notion = Client(auth=NOTION_TOKEN)
 
-# --- FUNÇÕES DE TRATAMENTO ---
+# Cache para não consultar a mesma casa 1000 vezes
+CACHE_PROPERTY_GROUPS = {} 
+
+# --- FUNÇÕES ---
 
 def parse_dt_robusto(data_str):
     if not data_str: return None
@@ -44,29 +45,8 @@ def gerar_status_visual(tipo, code):
     elif code_str in ['2', '4']: suffix = "BKD"
     elif code_str == '5': suffix = "OUT"
     elif code_str == '9': suffix = "REQ"
-    
     tipo_limpo = str(tipo).split(' ')[0][:10]
     return f"{tipo_limpo}-{suffix}"
-
-def extrair_property_group(r):
-    """
-    Extrai o nome do Grupo a partir do nome da Unidade (Casa).
-    Ex: "Residencial Flores - Casa 01" -> "Residencial Flores"
-    """
-    unit_name = str(r.get('unit_name', '')).strip()
-    
-    # Se o nome da casa tiver um separador, pegamos a parte antes dele
-    separadores = [" - ", " | ", " # "]
-    for sep in separadores:
-        if sep in unit_name:
-            return unit_name.split(sep)[0].strip()
-    
-    # Fallback: Se não houver separador, tenta o campo nativo de condomínio
-    condo = str(r.get('condo_type_name', '')).strip()
-    if condo and condo.lower() != "none" and condo != "":
-        return condo
-        
-    return str(r.get('location_name', 'Geral')).strip()
 
 def buscar_pagina_notion(res_number):
     try:
@@ -80,30 +60,80 @@ def buscar_pagina_notion(res_number):
         pass
     return None
 
-def upsert_reserva(reserva, ano_alvo):
+# --- AQUI ESTÁ A "MAGIA" (SEM PREGUIÇA) ---
+def buscar_grupo_oficial(unit_id):
+    """
+    Consulta a API GetPropertyInfo para pegar o Property Group REAL.
+    Usa cache para não deixar o script lento.
+    """
+    unit_id_str = str(unit_id)
+    
+    # 1. Se já consultamos essa casa antes, retorna do cache (Rápido)
+    if unit_id_str in CACHE_PROPERTY_GROUPS:
+        return CACHE_PROPERTY_GROUPS[unit_id_str]
+
+    # 2. Se não, consulta a API (GetPropertyInfo)
+    print(f"   🔍 Consultando Property Group da Unidade {unit_id_str}...")
+    payload = {
+        "methodName": "GetPropertyInfo",
+        "params": {
+            "token_key": STREAMLINE_KEY,
+            "token_secret": STREAMLINE_SECRET,
+            "unit_id": unit_id
+        }
+    }
+    
+    try:
+        response = requests.post(URL_STREAMLINE, json=payload, timeout=30)
+        data = response.json()
+        
+        # Procura onde o dado está (pode variar dependendo da versão da API)
+        info = {}
+        if 'data' in data: info = data['data']
+        elif 'Response' in data and 'data' in data['Response']: info = data['Response']['data']
+        
+        # O CAMPO MÁGICO DA DOCUMENTAÇÃO: condo_type_group_name
+        group_name = info.get('condo_type_group_name')
+        
+        # Se não achar, tenta location_area_name ou location_name como fallback
+        if not group_name:
+            group_name = info.get('location_name', '---')
+            
+        # Salva no cache
+        CACHE_PROPERTY_GROUPS[unit_id_str] = str(group_name).strip()
+        return CACHE_PROPERTY_GROUPS[unit_id_str]
+
+    except Exception as e:
+        print(f"   ⚠️ Falha ao buscar info da unidade {unit_id}: {e}")
+        return None
+
+def upsert_reserva(reserva):
     res_id = str(reserva.get('confirmation_id'))
     if not res_id: return
     
-    # Datas
+    unit_id = reserva.get('unit_id')
+    
+    # --- BUSCA O GRUPO REAL NA API ---
+    prop_group_real = buscar_grupo_oficial(unit_id)
+    
+    # Limpeza para o Notion (Select não aceita vírgulas)
+    if prop_group_real:
+        prop_group_clean = prop_group_real.replace(",", "").strip()[:100]
+        prop_group_payload = {"select": {"name": prop_group_clean}}
+    else:
+        prop_group_payload = {"select": None}
+
+    # Dados padrão
     dt_criacao = parse_dt_robusto(reserva.get('creation_date'))
     dt_ci = parse_dt_robusto(reserva.get('startdate') or reserva.get('start_date'))
     dt_co = parse_dt_robusto(reserva.get('enddate') or reserva.get('end_date'))
     
-    # Filtro opcional: Só processa se o check-in for do ano que estamos varrendo
-    if dt_ci and dt_ci.year != ano_alvo:
-        return
-
     nome = f"{reserva.get('first_name', '')} {reserva.get('last_name', '')}".strip()
     status_visual = gerar_status_visual(reserva.get('type_name', '---'), reserva.get('status_code'))
     state_binario = obter_estado_binario(reserva.get('status_code'))
     room = str(reserva.get('unit_name', 'Unknown'))
     gst = f"{reserva.get('occupants',0)}|{reserva.get('occupants_small',0)}"
     
-    # --- TRATAMENTO PROPERTY GROUP (SELECT) ---
-    prop_group_raw = extrair_property_group(reserva)
-    prop_group_clean = prop_group_raw.replace(",", "").strip()[:100]
-    prop_group_payload = {"select": {"name": prop_group_clean}} if prop_group_clean else {"select": None}
-
     try: total = float(reserva.get('price_total', 0))
     except: total = 0.0
     try: rate = float(reserva.get('price_nightly', 0))
@@ -119,7 +149,7 @@ def upsert_reserva(reserva, ano_alvo):
         "NTS": {"number": nights},
         "GST": {"rich_text": [{"text": {"content": gst}}]},
         "Room": {"rich_text": [{"text": {"content": room[:200]}}]},
-        "Property Group": prop_group_payload,
+        "Property Group": prop_group_payload, # Dado Oficial
         "Total": {"number": total},
         "TL Rate": {"number": rate}
     }
@@ -134,74 +164,79 @@ def upsert_reserva(reserva, ano_alvo):
         try:
             if page_id:
                 notion.pages.update(page_id=page_id, properties=props)
-                print(f"    🔄 {res_id} (Upd) -> {prop_group_clean}")
+                print(f"   🔄 {res_id} (Upd) -> Group: {prop_group_clean}")
             else:
                 notion.pages.create(parent={"database_id": NOTION_DB_ID}, properties=props)
-                print(f"    ✨ {res_id} (New) -> {prop_group_clean}")
+                print(f"   ✨ {res_id} (New) -> Group: {prop_group_clean}")
             time.sleep(0.4)
             return
         except Exception as e:
             time.sleep(1)
 
 def executar_sincronizacao():
-    # --- AJUSTE AQUI OS ANOS QUE QUER RODAR ---
-    anos_para_processar = [2024, 2025, 2026]
+    print("🚀 Sincronizando (Consulta Oficial Property Group)...")
     
-    print(f"🚀 Iniciando Sincronização para os anos: {anos_para_processar}")
-    
-    for ano in anos_para_processar:
-        print(f"\n📅 --- PROCESSANDO ANO {ano} ---")
-        page = 1
-        limit = 50 
+    page = 1
+    total_processado = 0
+    limit = 50 
 
-        while True:
-            print(f"📖 Lendo Página {page}...")
+    while True:
+        print(f"\n📖 Lendo Reservas - Página {page}...")
 
-            payload = {
-                "methodName": "GetReservationsFiltered",
-                "params": {
-                    "token_key": STREAMLINE_KEY,
-                    "token_secret": STREAMLINE_SECRET,
-                    "return_full": True,
-                    "limit": limit,      
-                    "p": page,
-                    "modified_since": f"{ano}-01-01 00:00:00"
-                }
+        payload = {
+            "methodName": "GetReservationsFiltered",
+            "params": {
+                "token_key": STREAMLINE_KEY,
+                "token_secret": STREAMLINE_SECRET,
+                "return_full": True,
+                "limit": limit,      
+                "p": page,
+                "modified_since": "2023-01-01 00:00:00"
             }
+        }
 
-            try:
-                response = requests.post(URL_STREAMLINE, json=payload, timeout=90)
-                dados = response.json()
-
-                if isinstance(dados, dict) and 'status' in dados and dados['status'].get('code') == 'E0105':
-                    print("⚠️ Erro de limite API. Pausando 10s...")
-                    time.sleep(10)
-                    continue
-
-                lista_reservas = []
-                if 'data' in dados and 'reservations' in dados['data']:
-                    lista_reservas = dados['data']['reservations']
-                elif 'Response' in dados:
-                    lista_reservas = dados['Response'].get('data', [])
-                
-                qtd = len(lista_reservas)
-                print(f"📦 {qtd} reservas na página.")
-
-                if qtd == 0:
-                    print(f"✅ Ano {ano} finalizado!")
-                    break
-
-                for r in lista_reservas:
-                    upsert_reserva(r, ano)
-                
+        try:
+            response = requests.post(URL_STREAMLINE, json=payload, timeout=90)
+            
+            try: dados = response.json()
+            except: 
                 page += 1
-                time.sleep(1) 
+                continue
+            
+            # Checagem de Erro E0105 (Limite)
+            if isinstance(dados, dict) and 'status' in dados and dados['status'].get('code') == 'E0105':
+                print("⚠️ Limite API atingido. Pausando 10s...")
+                time.sleep(10)
+                continue
 
-            except Exception as e:
-                print(f"❌ Erro de conexão: {e}")
-                time.sleep(5)
+            lista_reservas = []
+            if 'data' in dados and 'reservations' in dados['data']:
+                lista_reservas = dados['data']['reservations']
+            elif 'Response' in dados:
+                lista_reservas = dados['Response'].get('data', [])
+            
+            qtd = len(lista_reservas)
+            print(f"📦 {qtd} reservas encontradas.")
 
-    print(f"\n🏁 SINCRONIZAÇÃO COMPLETA!")
+            if qtd == 0:
+                print("🏁 Sincronização Finalizada!")
+                break
+
+            for i, r in enumerate(lista_reservas):
+                upsert_reserva(r)
+                
+                # A cada 10 reservas, dá uma respirada leve para não travar na consulta de property info
+                if i % 10 == 0: time.sleep(0.5)
+            
+            total_processado += qtd
+            page += 1
+            time.sleep(1) 
+
+        except Exception as e:
+            print(f"❌ Erro de conexão: {e}")
+            time.sleep(5)
+
+    print(f"\n✅ Total Processado: {total_processado}")
 
 if __name__ == "__main__":
     executar_sincronizacao()
