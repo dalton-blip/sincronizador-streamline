@@ -1,4 +1,5 @@
 import requests
+import json
 import os
 import time
 from datetime import datetime
@@ -45,13 +46,6 @@ def gerar_status_visual(tipo, code):
     tipo_limpo = str(tipo).split(' ')[0][:10]
     return f"{tipo_limpo}-{suffix}"
 
-def determinar_stat_pagamento(r):
-    try:
-        balance = float(r.get('price_balance', 0))
-        return "PI" if balance <= 0 else "CC"
-    except:
-        return "CC"
-
 def buscar_pagina_notion(res_number):
     try:
         response = notion.databases.query(
@@ -66,8 +60,7 @@ def buscar_pagina_notion(res_number):
 
 def extrair_property_group(r):
     """
-    Tenta extrair o Grupo removendo o nome da unidade do tipo do condomínio.
-    Ex: 'Bolivar Vacations Sangria Sunset' - 'Sangria Sunset' = 'Bolivar Vacations'
+    Remove o nome da unidade do tipo do condomínio para sobrar só o Grupo.
     """
     unit_name = str(r.get('unit_name', '')).strip()
     condo_type = str(r.get('condo_type_name', '')).strip()
@@ -76,7 +69,6 @@ def extrair_property_group(r):
         group = condo_type.replace(unit_name, "").strip()
         if group: return group
     
-    # Se falhar a limpeza, retorna o condo_type inteiro ou location_name como fallback
     return condo_type if condo_type else str(r.get('location_name', '---'))
 
 def upsert_reserva(reserva):
@@ -94,8 +86,13 @@ def upsert_reserva(reserva):
     room = str(reserva.get('unit_name', 'Unknown'))
     gst = f"{reserva.get('occupants',0)}|{reserva.get('occupants_small',0)}"
     
-    # --- EXTRAÇÃO INTELIGENTE DO PROPERTY GROUP ---
-    prop_group = extrair_property_group(reserva)
+    # --- TRATAMENTO PARA CAMPO SELECT ---
+    prop_group_raw = extrair_property_group(reserva)
+    # Remove vírgulas (Notion não aceita em Select) e limita tamanho
+    prop_group_clean = prop_group_raw.replace(",", "").strip()[:100]
+    
+    # Lógica: Se tiver texto, manda o objeto Select. Se vazio, manda None.
+    prop_group_payload = {"select": {"name": prop_group_clean}} if prop_group_clean else {"select": None}
 
     try: total = float(reserva.get('price_total', 0))
     except: total = 0.0
@@ -112,12 +109,15 @@ def upsert_reserva(reserva):
         "NTS": {"number": nights},
         "GST": {"rich_text": [{"text": {"content": gst}}]},
         "Room": {"rich_text": [{"text": {"content": room[:200]}}]},
-        "Property Group": {"rich_text": [{"text": {"content": prop_group[:200]}}]}, # Aqui vai o grupo limpo
+        
+        # --- MUDANÇA AQUI: PROPERTY GROUP COMO SELECT ---
+        "Property Group": prop_group_payload,
+        
         "Total": {"number": total},
         "TL Rate": {"number": rate}
     }
 
-    if dt_created: props["Created"] = {"date": {"start": formatar_iso_date(dt_criacao)}}
+    if dt_criacao: props["Created"] = {"date": {"start": formatar_iso_date(dt_criacao)}}
     if dt_ci: props["CI"] = {"date": {"start": formatar_iso_date(dt_ci)}}
     if dt_co: props["CO"] = {"date": {"start": formatar_iso_date(dt_co)}}
 
@@ -127,17 +127,18 @@ def upsert_reserva(reserva):
         try:
             if page_id:
                 notion.pages.update(page_id=page_id, properties=props)
-                print(f"   🔄 {res_id} (Upd) -> {prop_group}")
+                print(f"   🔄 {res_id} (Upd) -> {prop_group_clean}")
             else:
                 notion.pages.create(parent={"database_id": NOTION_DB_ID}, properties=props)
-                print(f"   ✨ {res_id} (New) -> {prop_group}")
+                print(f"   ✨ {res_id} (New) -> {prop_group_clean}")
             time.sleep(0.4)
             return
         except Exception as e:
+            # print(f"Erro: {e}") 
             time.sleep(1)
 
 def executar_sincronizacao():
-    print("🚀 Sincronizando TUDO (Com Property Group Extraído)...")
+    print("🚀 Sincronizando TUDO (Property Group = SELECT)...")
     
     page = 1
     total_processado = 0
@@ -154,7 +155,7 @@ def executar_sincronizacao():
                 "return_full": True,
                 "limit": limit,      
                 "p": page,
-                "modified_since": "2023-01-01 00:00:00" # Histórico longo
+                "modified_since": "2023-01-01 00:00:00"
             }
         }
 
@@ -166,7 +167,6 @@ def executar_sincronizacao():
                 page += 1
                 continue
 
-            # Tratamento de erro de limite da API
             if isinstance(dados, dict) and 'status' in dados and dados['status'].get('code') == 'E0105':
                 print("⚠️ Erro de limite API. Pausando 10s...")
                 time.sleep(10)
