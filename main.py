@@ -1,22 +1,26 @@
 import requests
+import json
 import os
 import time
 from datetime import datetime
-from notion_client import Client
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # --- CONFIGURAÇÕES ---
 STREAMLINE_KEY = os.getenv("STREAMLINE_KEY")
 STREAMLINE_SECRET = os.getenv("STREAMLINE_SECRET")
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
-NOTION_DB_ID = os.getenv("NOTION_DB_ID")
+NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
 
 URL_STREAMLINE = "https://web.streamlinevrs.com/api/json"
+URL_NOTION = "https://api.notion.com/v1"
 
-# Inicializa Notion
-notion = Client(auth=NOTION_TOKEN)
-
-# --- CACHE (Memória para não consultar a mesma casa repetidamente) ---
-CACHE_PROPERTY_GROUPS = {}
+HEADERS_NOTION = {
+    "Authorization": f"Bearer {NOTION_TOKEN}",
+    "Content-Type": "application/json",
+    "Notion-Version": "2022-06-28"
+}
 
 # --- FUNÇÕES ---
 
@@ -44,92 +48,35 @@ def gerar_status_visual(tipo, code):
     if code_str == '8': suffix = "CXL"
     elif code_str in ['2', '4']: suffix = "BKD"
     elif code_str == '5': suffix = "OUT"
-    elif code_str == '9': suffix = "REQ"
-    
-    safe_tipo = str(tipo) if tipo else "---"
-    tipo_limpo = safe_tipo.split(' ')[0][:10]
+    tipo_limpo = str(tipo).split(' ')[0][:10]
     return f"{tipo_limpo}-{suffix}"
 
 def buscar_pagina_notion(res_number):
+    url = f"{URL_NOTION}/databases/{NOTION_DATABASE_ID}/query"
+    payload = {"filter": {"property": "Res #", "rich_text": {"equals": str(res_number)}}}
     try:
-        response = notion.databases.query(
-            database_id=NOTION_DB_ID,
-            filter={"property": "Res #", "rich_text": {"equals": str(res_number)}}
-        )
-        if response["results"]:
-            return response["results"][0]["id"]
-    except:
-        pass
+        response = requests.post(url, json=payload, headers=HEADERS_NOTION)
+        if response.status_code == 200:
+            results = response.json().get("results", [])
+            if results: return results[0]["id"]
+    except: pass
     return None
-
-# --- CONSULTA OFICIAL DA PROPRIEDADE ---
-def buscar_grupo_oficial(unit_id):
-    """
-    1. Verifica cache.
-    2. Se não tiver, chama GetPropertyInfo.
-    3. Retorna o condo_type_group_name oficial.
-    """
-    unit_id_str = str(unit_id)
-    
-    # Se já consultamos essa casa nesta execução, retorna da memória
-    if unit_id_str in CACHE_PROPERTY_GROUPS:
-        return CACHE_PROPERTY_GROUPS[unit_id_str]
-
-    # Se não, consulta a API
-    # print(f"      🔎 Consultando API para Unit ID: {unit_id_str}") # Debug
-    payload = {
-        "methodName": "GetPropertyInfo",
-        "params": {
-            "token_key": STREAMLINE_KEY,
-            "token_secret": STREAMLINE_SECRET,
-            "unit_id": unit_id
-        }
-    }
-    
-    try:
-        # Timeout curto para não gargalar o script inteiro
-        resp = requests.post(URL_STREAMLINE, json=payload, timeout=10)
-        data = resp.json()
-        
-        info = {}
-        if 'data' in data: info = data['data']
-        elif 'Response' in data and 'data' in data['Response']: info = data['Response']['data']
-        
-        # Pega o dado oficial
-        group_name = info.get('condo_type_group_name')
-        
-        # Fallback se vier vazio
-        if not group_name:
-            group_name = info.get('location_name', '---')
-            
-        # Salva no cache
-        CACHE_PROPERTY_GROUPS[unit_id_str] = str(group_name).strip()
-        return CACHE_PROPERTY_GROUPS[unit_id_str]
-
-    except Exception as e:
-        print(f"      ⚠️ Erro ao consultar casa {unit_id}: {e}")
-        return None
 
 def upsert_reserva(reserva):
     res_id = str(reserva.get('confirmation_id'))
     if not res_id: return
     
-    # 1. Obter Property Group Oficial (Com Cache)
-    unit_id = reserva.get('unit_id')
-    prop_group_real = buscar_grupo_oficial(unit_id)
-    
-    # Limpeza para Notion Select (sem vírgulas)
-    if prop_group_real:
-        prop_group_clean = prop_group_real.replace(",", "").strip()[:100]
-        prop_group_payload = {"select": {"name": prop_group_clean}}
-    else:
-        prop_group_payload = {"select": None}
-
-    # 2. Processar outros dados
+    # Datas
     dt_criacao = parse_dt_robusto(reserva.get('creation_date'))
     dt_ci = parse_dt_robusto(reserva.get('startdate') or reserva.get('start_date'))
     dt_co = parse_dt_robusto(reserva.get('enddate') or reserva.get('end_date'))
     
+    # --- FILTRO DE SEGURANÇA 2026 ---
+    # Só salva se o check-in for em 2026
+    if dt_ci and dt_ci.year != 2026:
+        # print(f"Ignorando ano {dt_ci.year}") # Silencioso
+        return
+
     nome = f"{reserva.get('first_name', '')} {reserva.get('last_name', '')}".strip()
     status_visual = gerar_status_visual(reserva.get('type_name', '---'), reserva.get('status_code'))
     state_binario = obter_estado_binario(reserva.get('status_code'))
@@ -144,73 +91,77 @@ def upsert_reserva(reserva):
     except: nights = 0
 
     props = {
-        "Name": {"title": [{"text": {"content": nome[:100]}}]},
+        "Name": {"title": [{"text": {"content": nome}}]},
         "Res #": {"rich_text": [{"text": {"content": res_id}}]},
         "Status": {"select": {"name": status_visual}},
         "State": {"select": {"name": state_binario}},
         "NTS": {"number": nights},
         "GST": {"rich_text": [{"text": {"content": gst}}]},
-        "Room": {"rich_text": [{"text": {"content": room[:200]}}]},
-        "Property Group": prop_group_payload, # Campo oficial
+        "Room": {"rich_text": [{"text": {"content": room}}]},
         "Total": {"number": total},
         "TL Rate": {"number": rate}
     }
-
     if dt_criacao: props["Created"] = {"date": {"start": formatar_iso_date(dt_criacao)}}
     if dt_ci: props["CI"] = {"date": {"start": formatar_iso_date(dt_ci)}}
     if dt_co: props["CO"] = {"date": {"start": formatar_iso_date(dt_co)}}
 
-    # 3. Enviar ao Notion
     page_id = buscar_pagina_notion(res_id)
+    payload = {"properties": props}
     
+    # Retry Notion
     for _ in range(3):
         try:
             if page_id:
-                notion.pages.update(page_id=page_id, properties=props)
-                print(f"   🔄 {res_id} (Upd) -> {prop_group_clean}")
+                res = requests.patch(f"{URL_NOTION}/pages/{page_id}", json=payload, headers=HEADERS_NOTION)
+                print(f"   🔄 {res_id} (Atualizada)")
             else:
-                notion.pages.create(parent={"database_id": NOTION_DB_ID}, properties=props)
-                print(f"   ✨ {res_id} (New) -> {prop_group_clean}")
-            time.sleep(0.4) 
+                payload["parent"] = {"database_id": NOTION_DATABASE_ID}
+                res = requests.post(f"{URL_NOTION}/pages", json=payload, headers=HEADERS_NOTION)
+                print(f"   ✨ {res_id} (Criada)")
+            
+            if res.status_code == 429:
+                time.sleep(2)
+                continue
             return
-        except Exception as e:
+        except:
             time.sleep(1)
 
 def executar_sincronizacao():
-    print("🚀 Sincronizando (Paginação + Property Group Oficial)...")
+    print("🚀 TESTE 2026 (Paginação + Modified Since)...")
     
     page = 1
     total_processado = 0
     limit = 50 
 
     while True:
-        print(f"\n📖 Lendo Página {page}...")
+        print(f"\n📖 Lendo Página {page} (Busca Modificados em 2026)...")
 
-        # Voltamos com a estrutura que funcionava
         payload = {
             "methodName": "GetReservationsFiltered",
             "params": {
                 "token_key": STREAMLINE_KEY,
                 "token_secret": STREAMLINE_SECRET,
-                "return_full": True,
-                "limit": limit,      
+                "return_full": True, # Queremos detalhes!
+                "limit": limit,      # De 50 em 50 para não travar
                 "p": page,
-                "modified_since": "2023-01-01 00:00:00"
+                "modified_since": "2026-01-01 00:00:00" # <--- O ÚNICO FILTRO QUE FUNCIONA
             }
         }
 
         try:
             response = requests.post(URL_STREAMLINE, json=payload, timeout=60)
             
-            try: dados = response.json()
-            except: 
+            try:
+                dados = response.json()
+            except:
                 print("❌ Erro JSON. Tentando próxima página...")
                 page += 1
                 continue
 
+            # Se der erro 10k aqui, a API é muito mal feita, mas com paginação deve passar
             if isinstance(dados, dict) and 'status' in dados and dados['status'].get('code') == 'E0105':
-                print("⚠️ Erro de limite API. Pausando 10s...")
-                time.sleep(10)
+                print("⚠️ Erro de limite 10k mesmo com paginação. API instável.")
+                time.sleep(5)
                 continue
 
             lista_reservas = []
@@ -220,26 +171,24 @@ def executar_sincronizacao():
                 lista_reservas = dados['Response'].get('data', [])
             
             qtd = len(lista_reservas)
-            print(f"📦 {qtd} reservas nesta página.")
+            print(f"📦 {qtd} reservas recebidas.")
 
             if qtd == 0:
-                print("🏁 Sincronização Finalizada (0 itens retornados na página).")
+                print("🏁 Fim das páginas. Tudo sincronizado!")
                 break
 
-            for i, r in enumerate(lista_reservas):
+            for r in lista_reservas:
                 upsert_reserva(r)
-                # Pequena pausa a cada 10 para não estourar chamadas de Property Info
-                if i % 10 == 0: time.sleep(0.2)
             
             total_processado += qtd
             page += 1
-            time.sleep(1) 
+            time.sleep(1) # Respira
 
         except Exception as e:
-            print(f"❌ Erro de conexão na página {page}: {e}")
+            print(f"❌ Erro fatal: {e}")
             time.sleep(5)
 
-    print(f"\n✅ Total Processado: {total_processado}")
+    print(f"\n✅ FIM! Total analisado: {total_processado}")
 
 if __name__ == "__main__":
     executar_sincronizacao()
