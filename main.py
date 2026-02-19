@@ -26,45 +26,59 @@ CACHE_GRUPOS = {}
 
 # --- FUNÇÕES ---
 
-def buscar_nomes_dos_grupos():
+def listar_e_mapear_grupos():
+    """Baixa e imprime os 21 grupos para conferência no terminal"""
+    print("\n--- 📑 MAPEANDO OS 21 GRUPOS DA API ---")
     payload = {
         "methodName": "GetRoomTypeGroupsList",
         "params": {"token_key": STREAMLINE_KEY, "token_secret": STREAMLINE_SECRET}
     }
+    mapping = {}
     try:
         r = requests.post(URL_STREAMLINE, json=payload, timeout=30)
         dados = r.json()
         grupos = dados.get('data', {}).get('group', [])
+        
         if isinstance(grupos, dict): grupos = [grupos]
-        return {str(g.get('id')): g.get('name') for g in grupos}
-    except: return {}
+        
+        for g in grupos:
+            g_id = str(g.get('id'))
+            g_nome = g.get('name')
+            mapping[g_id] = g_nome
+            print(f"ID: {g_id.ljust(6)} | Grupo: {g_nome}")
+            
+        print(f"--- ✅ {len(mapping)} grupos carregados ---\n")
+        return mapping
+    except Exception as e:
+        print(f"❌ Erro ao listar grupos: {e}")
+        return {}
 
 def extrair_property_group(r):
-    """
-    NOVA LÓGICA: Procura 'Bolivar' ou 'San Antonio' em qualquer lugar da reserva.
-    """
-    prioritarios = ["Bolivar Vacations", "San Antonio"]
+    """Lógica baseada nos IDs dos 21 grupos e palavras-chave"""
     
-    # 1. BUSCA EXAUSTIVA: Procura as palavras-chave em todos os campos de texto da reserva
-    # Isso resolve o caso da 'Flip Flop' que tem 'Bolivar' escondido em algum campo
+    # 1. Prioridade absoluta por texto (Bolivar / San Antonio)
+    prioritarios = ["Bolivar Vacations", "San Antonio"]
+    unit_name = str(r.get('unit_name', '')).strip()
+    
+    # Busca nos campos de texto da reserva
     for p in prioritarios:
-        for valor in r.values():
-            if isinstance(valor, str) and p.lower() in valor.lower():
+        for campo in ['unit_name', 'condo_type_name', 'location_name', 'resort_name']:
+            valor = str(r.get(campo, '')).lower()
+            if p.lower() in valor:
                 return p
 
-    # 2. SE NÃO ACHOU PRIORIDADE, tenta a lógica de mapeamento por ID
+    # 2. Mapeamento pelos 21 grupos (ID vindo da reserva)
     group_id = str(r.get('room_type_group_id', ''))
-    api_group_name = CACHE_GRUPOS.get(group_id, "")
-    
-    # 3. SE O NOME DA API FOR GENÉRICO (ex: '4 Bedroom'), tenta limpar o nome da casa
-    unit_name = str(r.get('unit_name', '')).strip()
-    if api_group_name and ("bedroom" in api_group_name.lower() or "studio" in api_group_name.lower()):
-        for sep in [" - ", " | ", " # "]:
-            if sep in unit_name:
-                return unit_name.split(sep)[0].strip()
+    if group_id in CACHE_GRUPOS:
+        nome_grupo = CACHE_GRUPOS[group_id]
+        # Se o nome do grupo for genérico (ex: 4 Bedroom), tenta pegar o prefixo da casa
+        if "bedroom" in nome_grupo.lower() or "studio" in nome_grupo.lower():
+            if " - " in unit_name:
+                return unit_name.split(" - ")[0].strip()
+        return nome_grupo
 
-    # Fallback final
-    return api_group_name or r.get('condo_type_name') or r.get('location_name') or "Geral"
+    # 3. Fallback
+    return r.get('condo_type_name') or "Geral"
 
 def parse_dt_robusto(data_str):
     if not data_str: return None
@@ -92,10 +106,8 @@ def upsert_reserva(reserva):
     res_id = str(reserva.get('confirmation_id'))
     dt_ci = parse_dt_robusto(reserva.get('startdate') or reserva.get('start_date'))
     
-    # Mantendo o filtro de 2026 para o seu teste
     if not dt_ci or dt_ci.year != 2026: return
 
-    # Aqui a nova lógica entra em ação
     pg_clean = str(extrair_property_group(reserva)).replace(",", "").strip()[:100]
 
     props = {
@@ -112,16 +124,18 @@ def upsert_reserva(reserva):
     
     if page_id:
         requests.patch(f"{URL_NOTION}/pages/{page_id}", json=payload, headers=HEADERS_NOTION)
-        print(f"   🔄 {res_id} Atualizada -> {pg_clean}")
+        print(f"   🔄 {res_id} -> {pg_clean}")
     else:
         payload["parent"] = {"database_id": NOTION_DATABASE_ID}
         requests.post(f"{URL_NOTION}/pages", json=payload, headers=HEADERS_NOTION)
-        print(f"   ✨ {res_id} Criada -> {pg_clean}")
+        print(f"   ✨ {res_id} -> {pg_clean}")
 
 def executar_sincronizacao():
     global CACHE_GRUPOS
-    print("🚀 Sincronizando (Busca Total de Prioridades)...")
-    CACHE_GRUPOS = buscar_nomes_dos_grupos()
+    print("🚀 Iniciando Sincronização...")
+    
+    # 1. Mapeia os 21 grupos primeiro
+    CACHE_GRUPOS = listar_e_mapear_grupos()
 
     page = 1
     while True:
