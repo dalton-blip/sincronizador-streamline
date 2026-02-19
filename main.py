@@ -22,104 +22,92 @@ HEADERS_NOTION = {
     "Notion-Version": "2022-06-28"
 }
 
-# Memória do Robô
-CACHE_GRUPOS = {}
-MAPA_PROPRIEDADES = {}
+# Mapas de Memória
+CACHE_NOMES_GRUPOS = {}
+MAPA_HOME_PARA_GRUPO = {}
 
-# --- 1. MAPEAMENTO (PEGA A CONFIGURAÇÃO ATUAL) ---
+# --- 1. MAPEAMENTO DE PROPRIEDADES ---
 
 def carregar_mapeamento_atual():
-    global CACHE_GRUPOS, MAPA_PROPRIEDADES
-    print("\n--- 🧠 CARREGANDO CONFIGURAÇÃO ATUAL DAS CASAS ---")
+    global CACHE_NOMES_GRUPOS, MAPA_HOME_PARA_GRUPO
+    print("\n--- 🧠 MAPEANDO GRUPOS E HOMES ---")
     
-    # Parte A: Lista os 21 Grupos
-    payload_gr = {
-        "methodName": "GetRoomTypeGroupsList",
-        "params": {"token_key": STREAMLINE_KEY, "token_secret": STREAMLINE_SECRET}
-    }
+    # Parte A: Pegar nomes dos 21 Grupos
     try:
-        r = requests.post(URL_STREAMLINE, json=payload_gr, timeout=45)
-        res_json = r.json()
-        # Trata as variações de estrutura da API
-        data_gr = res_json.get('data', {}) or res_json.get('Response', {}).get('data', {})
-        grupos = data_gr.get('group', [])
+        payload_gr = {
+            "methodName": "GetRoomTypeGroupsList",
+            "params": {"token_key": STREAMLINE_KEY, "token_secret": STREAMLINE_SECRET}
+        }
+        r = requests.post(URL_STREAMLINE, json=payload_gr, timeout=40)
+        dados = r.json()
+        data_resp = dados.get('data', {}) or dados.get('Response', {}).get('data', {})
+        grupos = data_resp.get('group', [])
         if isinstance(grupos, dict): grupos = [grupos]
-        CACHE_GRUPOS = {str(g.get('id')): g.get('name') for g in grupos}
-        print(f"✅ {len(CACHE_GRUPOS)} grupos identificados.")
-    except: print("⚠️ Falha ao carrerar nomes dos grupos.")
+        
+        CACHE_NOMES_GRUPOS = {str(g.get('id')): g.get('name') for g in grupos}
+        print(f"✅ {len(CACHE_NOMES_GRUPOS)} grupos carregados.")
+    except: print("⚠️ Erro ao carregar nomes dos grupos.")
 
-    # Parte B: Lista todas as Casas (Properties) e seus grupos atuais
-    payload_prop = {
-        "methodName": "GetPropertiesList",
-        "params": {"token_key": STREAMLINE_KEY, "token_secret": STREAMLINE_SECRET, "return_full": True}
-    }
+    # Parte B: Mapear home_id para o Grupo
     try:
+        payload_prop = {
+            "methodName": "GetPropertiesList",
+            "params": {"token_key": STREAMLINE_KEY, "token_secret": STREAMLINE_SECRET}
+        }
         r = requests.post(URL_STREAMLINE, json=payload_prop, timeout=60)
-        res_json = r.json()
-        data_prop = res_json.get('data', {}) or res_json.get('Response', {}).get('data', {})
-        casas = data_prop.get('property', [])
+        dados = r.json()
+        
+        # Procura a lista de casas (pode vir como 'property' ou 'home')
+        data_resp = dados.get('data', {}) or dados.get('Response', {}).get('data', {})
+        casas = data_resp.get('property', []) or data_resp.get('home', [])
+        
         if isinstance(casas, dict): casas = [casas]
         
         for c in casas:
-            u_id = str(c.get('unit_id'))
+            # Pegamos o home_id ou unit_id (o que estiver disponível)
+            h_id = str(c.get('home_id') or c.get('unit_id'))
             g_id = str(c.get('room_type_group_id'))
+            
+            nome_grupo = CACHE_NOMES_GRUPOS.get(g_id, "Geral")
+            
+            # Forçamos a prioridade por nome se o grupo na API estiver errado
             u_name = str(c.get('unit_name', '')).lower()
-            
-            nome_grupo = CACHE_GRUPOS.get(g_id, "Geral")
-            
-            # Prioridade Bolivar e San Antonio baseada no nome da casa
             if "bolivar" in u_name: nome_grupo = "Bolivar Vacations"
             elif "san antonio" in u_name: nome_grupo = "San Antonio"
             
-            MAPA_PROPRIEDADES[u_id] = nome_grupo
-        print(f"✅ {len(MAPA_PROPRIEDADES)} casas mapeadas aos seus grupos atuais.")
+            if h_id != "None":
+                MAPA_HOME_PARA_GRUPO[h_id] = nome_grupo
+
+        print(f"✅ {len(MAPA_HOME_PARA_GRUPO)} casas mapeadas com sucesso.")
     except Exception as e:
-        print(f"❌ Erro ao mapear casas: {e}")
+        print(f"❌ Erro no mapeamento: {e}")
 
-# --- 2. AUXILIARES ---
-
-def parse_dt_robusto(data_str):
-    if not data_str: return None
-    try:
-        data_str = str(data_str).strip()
-        formatos = ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%m/%d/%Y %H:%M:%S", "%m/%d/%Y"]
-        for fmt in formatos:
-            try: return datetime.strptime(data_str, fmt)
-            except ValueError: continue
-    except: return None
-    return None
+# --- 2. SINCRONIZAÇÃO ---
 
 def upsert_reserva(reserva):
     res_id = str(reserva.get('confirmation_id'))
-    dt_ci = parse_dt_robusto(reserva.get('startdate') or reserva.get('start_date'))
     
-    # FILTRO 2026
-    if not dt_ci or dt_ci.year != 2026: return
+    # Filtro de Ano (Sempre 2026 para o teste)
+    dt_raw = reserva.get('startdate') or reserva.get('start_date')
+    if not dt_raw or "2026" not in str(dt_raw): return
 
-    # PEGA O GRUPO ATUAL DA CASA (IGNORA O PASSADO DA RESERVA)
-    unit_id = str(reserva.get('unit_id'))
-    nome_grupo = MAPA_PROPRIEDADES.get(unit_id)
+    # A CHAVE: Procurar pelo home_id da reserva no nosso mapa de casas
+    h_id_res = str(reserva.get('home_id') or reserva.get('unit_id'))
+    nome_grupo = MAPA_HOME_PARA_GRUPO.get(h_id_res, "Geral")
     
-    # Se não achou no mapa, tenta uma busca por texto no nome da reserva
-    if not nome_grupo:
-        u_name_res = str(reserva.get('unit_name', '')).lower()
-        if "bolivar" in u_name_res: nome_grupo = "Bolivar Vacations"
-        elif "san antonio" in u_name_res: nome_grupo = "San Antonio"
-        else: nome_grupo = "Geral"
-
-    nome_hospede = f"{reserva.get('first_name', '')} {reserva.get('last_name', '')}"[:100]
-    unit_name = str(reserva.get('unit_name', ''))[:200]
+    unit_name = str(reserva.get('unit_name', ''))
+    hospede = f"{reserva.get('first_name', '')} {reserva.get('last_name', '')}"[:100]
 
     props = {
-        "Name": {"title": [{"text": {"content": nome_hospede}}]},
+        "Name": {"title": [{"text": {"content": hospede}}]},
         "Res #": {"rich_text": [{"text": {"content": res_id}}]},
-        "Room": {"rich_text": [{"text": {"content": unit_name}}]},
-        "Property Group": {"select": {"name": str(nome_grupo)}},
+        "Room": {"rich_text": [{"text": {"content": unit_name[:200]}}]},
+        "Property Group": {"select": {"name": nome_grupo}},
         "Total": {"number": float(reserva.get('price_total', 0) or 0)},
-        "CI": {"date": {"start": dt_ci.strftime("%Y-%m-%d")}}
+        "CI": {"date": {"start": str(dt_raw)[:10]}}
     }
 
-    # Busca no Notion
+    # Verifica se já existe para atualizar
     query = requests.post(f"{URL_NOTION}/databases/{NOTION_DATABASE_ID}/query", 
                           json={"filter": {"property": "Res #", "rich_text": {"equals": res_id}}}, 
                           headers=HEADERS_NOTION).json()
@@ -134,10 +122,11 @@ def upsert_reserva(reserva):
                       headers=HEADERS_NOTION)
         print(f"   ✨ {res_id} ({unit_name}) -> {nome_grupo}")
 
-# --- 3. EXECUÇÃO ---
-
 def executar():
     carregar_mapeamento_atual()
+    
+    if not MAPA_HOME_PARA_GRUPO:
+        print("⚠️ Atenção: Nenhuma casa foi mapeada. Verifique os campos da API.")
     
     page = 1
     while True:
@@ -156,35 +145,20 @@ def executar():
         
         try:
             r = requests.post(URL_STREAMLINE, json=payload, timeout=60)
-            res_json = r.json()
+            dados = r.json()
+            data_resp = dados.get('data', {}) or dados.get('Response', {}).get('data', {})
+            reservas = data_resp.get('reservations', [])
             
-            # TRATAMENTO ROBUSTO PARA ACHAR A LISTA DE RESERVAS
-            data_resp = res_json.get('data', {}) or res_json.get('Response', {}).get('data', {})
-            # Em algumas versões a lista está direto em Response -> data
-            reservas = data_resp.get('reservations') if isinstance(data_resp, dict) else None
-            if reservas is None:
-                # Tentativa final: Response -> data é a própria lista
-                if isinstance(data_resp, list):
-                    reservas = data_resp
-                else:
-                    reservas = []
-
-            qtd = len(reservas)
-            print(f"📦 {qtd} reservas encontradas.")
-
-            if qtd == 0: break
+            if not reservas: break
 
             for res in reservas:
                 upsert_reserva(res)
             
             page += 1
-            time.sleep(0.5)
-            
+            time.sleep(1)
         except Exception as e:
-            print(f"❌ Erro na página {page}: {e}")
+            print(f"❌ Erro: {e}")
             break
-
-    print("\n🏁 Sincronização Finalizada!")
 
 if __name__ == "__main__":
     executar()
